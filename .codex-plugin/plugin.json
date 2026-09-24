@@ -1,7 +1,7 @@
 {
   "name": "implementation-workflow",
-  "version": "0.2.0",
-  "description": "문서 기반 구현을 설계·검토·승인·테스트·QA 단계로 진행하는 Codex 스킬, 훅, 하네스와 오케스트라",
+  "version": "0.3.0",
+  "description": "문서 기반 구현을 세 명의 독립 설계·코드 검토자와 QA 담당자로 진행하는 Codex 스킬, 훅, 하네스와 오케스트라",
   "author": {
     "name": "BS-Stack-Lab",
     "url": "https://github.com/BS-Stack-Lab"
@@ -10,7 +10,7 @@
   "interface": {
     "displayName": "Implementation Workflow",
     "shortDescription": "문서 기반 구현과 단계별 검토·QA",
-    "longDescription": "요청 문서를 읽고 설계 초안을 독립 검토한 뒤 승인된 설계에 따라 구현·검증·QA를 진행합니다.",
+    "longDescription": "요청 문서를 읽고 세 명이 설계와 구현을 각각 독립 검토하며 세 명이 QA를 진행합니다.",
     "developerName": "BS-Stack-Lab",
     "category": "Productivity",
     "capabilities": [

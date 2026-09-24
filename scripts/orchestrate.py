@@ -24,12 +24,16 @@ def build_plan(scope: str, review_mode: str = "immediate") -> list[dict[str, obj
             tasks.append({"id": f"present-design-{area}", "role": "coordinator",
                           "depends_on": [design_dependency]})
             design_dependency = f"present-design-{area}"
-        tasks.append({"id": f"review-design-{area}", "role": f"{area}-design-reviewer",
-                      "depends_on": [design_dependency]})
-    design_reviews = [f"review-design-{area}" for area in areas]
+        for slot in range(1, 4):
+            tasks.append({"id": f"review-design-{area}-{slot}",
+                          "role": f"{area}-design-reviewer-{slot}",
+                          "depends_on": [design_dependency]})
+    design_reviews = [f"review-design-{area}-{slot}" for area in areas for slot in range(1, 4)]
     if scope == "both":
-        tasks.append({"id": "review-contract", "role": "contract-reviewer", "depends_on": design_reviews})
-        design_reviews = ["review-contract"]
+        for slot in range(1, 4):
+            tasks.append({"id": f"review-contract-{slot}", "role": f"contract-reviewer-{slot}",
+                          "depends_on": design_reviews})
+        design_reviews = [f"review-contract-{slot}" for slot in range(1, 4)]
     if review_mode == "user-review":
         tasks.append({"id": "accept-design", "role": "user", "depends_on": design_reviews})
         design_reviews = ["accept-design"]
@@ -37,12 +41,21 @@ def build_plan(scope: str, review_mode: str = "immediate") -> list[dict[str, obj
     for area in areas:
         tasks.append({"id": f"implement-{area}", "role": f"{area}-implementer", "depends_on": ["approval-gate"]})
         tasks.append({"id": f"test-{area}", "role": f"{area}-implementer", "depends_on": [f"implement-{area}"]})
-        tasks.append({"id": f"review-code-{area}", "role": f"{area}-code-reviewer", "depends_on": [f"test-{area}"]})
-        tasks.append({"id": f"qa-{area}", "role": f"{area}-qa", "depends_on": [f"review-code-{area}"]})
-    qa_tasks = [f"qa-{area}" for area in areas]
+        code_reviews = []
+        for slot in range(1, 4):
+            task_id = f"review-code-{area}-{slot}"
+            tasks.append({"id": task_id, "role": f"{area}-code-reviewer-{slot}",
+                          "depends_on": [f"test-{area}"]})
+            code_reviews.append(task_id)
+        for slot in range(1, 4):
+            tasks.append({"id": f"qa-{area}-{slot}", "role": f"{area}-qa-{slot}",
+                          "depends_on": code_reviews})
+    qa_tasks = [f"qa-{area}-{slot}" for area in areas for slot in range(1, 4)]
     if scope == "both":
-        tasks.append({"id": "qa-integration", "role": "integration-qa", "depends_on": qa_tasks})
-        qa_tasks = ["qa-integration"]
+        for slot in range(1, 4):
+            tasks.append({"id": f"qa-integration-{slot}", "role": f"integration-qa-{slot}",
+                          "depends_on": qa_tasks})
+        qa_tasks = [f"qa-integration-{slot}" for slot in range(1, 4)]
     tasks.append({"id": "final-report", "role": "coordinator", "depends_on": qa_tasks})
     return tasks
 

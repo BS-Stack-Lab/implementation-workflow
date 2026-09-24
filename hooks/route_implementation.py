@@ -57,8 +57,10 @@ def main() -> None:
                 "independent design review, or (2) let the user review the design "
                 "before implementation. Wait for an explicit answer. Never reuse "
                 "a choice from an earlier request or infer it from context. "
-                "Follow its design-review approval gate and independent "
-                "subagent review steps. Keep generated design and QA "
+                "Use a supported question UI with choices and free text when available. "
+                "Use three distinct subagents for each design review, code review, "
+                "and QA stage. Follow the design-review approval gate. "
+                "Keep generated design and QA "
                 "documents outside the target Git repository."
             ),
         }

@@ -1,12 +1,13 @@
-"""Exercise the real local artifact and approval gates."""
+"""Exercise local artifacts, three-agent gates, and v2 compatibility."""
 
 from __future__ import annotations
 
+import json
+import os
 import subprocess
 import sys
 import tempfile
 import unittest
-import os
 from pathlib import Path
 
 
@@ -22,7 +23,13 @@ class WorkflowHarnessTest(unittest.TestCase):
         self.addCleanup(self.temporary.cleanup)
         self.base = Path(self.temporary.name)
         self.repo = self.base / "target-repo"
-        (self.repo / ".git").mkdir(parents=True)
+        self.repo.mkdir()
+        subprocess.run(["git", "-C", str(self.repo), "init", "-q"], check=True)
+        (self.repo / "app.py").write_text("value = 1\n", encoding="utf-8")
+        subprocess.run(["git", "-C", str(self.repo), "add", "app.py"], check=True)
+        subprocess.run(["git", "-C", str(self.repo), "-c", "core.hooksPath=/dev/null",
+                        "-c", "user.name=Test", "-c", "user.email=test@example.test",
+                        "commit", "-qm", "initial"], check=True)
         self.run_dir = self.base / ".codex" / "implementation-workflow-runs" / "one"
 
     def call(self, *args: str, expected: int = 0) -> subprocess.CompletedProcess[str]:
@@ -36,6 +43,46 @@ class WorkflowHarnessTest(unittest.TestCase):
                   "--review-mode", review_mode, "--mode-reference", "user answered for this request",
                   "--run-dir", str(self.run_dir))
 
+    def write(self, name: str, content: str = "evidence\n") -> None:
+        (self.run_dir / name).write_text(content, encoding="utf-8")
+
+    def review(self, area: str, slot: int, result: str = "clear", agent_id: str | None = None) -> None:
+        stem = "integration-contract-review" if area == "integration" else f"{area}-design-review"
+        self.write(f"{stem}-{slot}.md", f"{result} by {slot}\n")
+        arguments = ["review", "--run-dir", str(self.run_dir), "--area", area,
+                     "--slot", str(slot), "--agent-id", agent_id or f"/root/design-{area}-{slot}",
+                     "--result", result]
+        if result == "changes-required":
+            arguments += ["--finding", "missing error case"]
+        self.call(*arguments)
+
+    def reviews(self, area: str) -> None:
+        for slot in (1, 2, 3):
+            self.review(area, slot)
+
+    def agent_result(self, stage: str, area: str, slot: int, result: str | None = None,
+                     agent_id: str | None = None) -> None:
+        result = result or ("clear" if stage == "code-review" else "pass")
+        self.write(f"{area}-{stage if stage == 'code-review' else 'qa'}-{slot}.md",
+                   f"{result} by {slot}\n")
+        self.call("agent-result", "--run-dir", str(self.run_dir), "--stage", stage,
+                  "--area", area, "--slot", str(slot),
+                  "--agent-id", agent_id or f"/root/{stage}-{area}-{slot}",
+                  "--result", result)
+
+    def agent_results(self, stage: str, area: str) -> None:
+        for slot in (1, 2, 3):
+            self.agent_result(stage, area, slot)
+
+    def check_record(self, area: str) -> None:
+        self.call("check-record", "--run-dir", str(self.run_dir), "--area", area,
+                  "--name", "tests", "--status", "pass", "--evidence", "test output")
+
+    def resolve_agent(self, stage: str, area: str, slot: int) -> None:
+        self.call("resolve-agent", "--run-dir", str(self.run_dir), "--stage", stage,
+                  "--area", area, "--slot", str(slot),
+                  "--reference", "issue repaired or false positive documented")
+
     def test_init_requires_current_request_choice_reference(self) -> None:
         self.call("init", "--repo", str(self.repo), "--scope", "frontend",
                   "--review-mode", "immediate", "--run-dir", str(self.run_dir), expected=2)
@@ -43,85 +90,202 @@ class WorkflowHarnessTest(unittest.TestCase):
                   "--review-mode", "immediate", "--mode-reference", " ",
                   "--run-dir", str(self.run_dir), expected=1)
         self.init("frontend")
-        self.assertIn('"mode_reference": "user answered for this request"',
-                      (self.run_dir / "state.json").read_text(encoding="utf-8"))
+        state = json.loads((self.run_dir / "state.json").read_text(encoding="utf-8"))
+        self.assertEqual(state["version"], 3)
+        self.assertEqual(state["mode_reference"], "user answered for this request")
 
-    def write(self, name: str, content: str = "evidence\n") -> None:
-        (self.run_dir / name).write_text(content, encoding="utf-8")
-
-    def test_frontend_scope_and_changed_design(self) -> None:
+    def test_three_design_code_and_qa_results_are_required(self) -> None:
         self.init("frontend")
         self.write("frontend-design.md")
         self.write("frontend-design-review.md")
-        self.call("review", "--run-dir", str(self.run_dir), "--area", "frontend", "--result", "clear")
-        self.call("check", "--run-dir", str(self.run_dir), "--gate", "design")
-        self.write("frontend-design.md", "revised design\n")
+        for slot in (1, 2):
+            self.review("frontend", slot)
         self.call("check", "--run-dir", str(self.run_dir), "--gate", "design", expected=1)
-        self.call("review", "--run-dir", str(self.run_dir), "--area", "frontend", "--result", "clear")
+        self.review("frontend", 3)
+        self.call("check", "--run-dir", str(self.run_dir), "--gate", "design")
         self.write("frontend-code-review.md")
         self.write("frontend-qa.md")
         self.write("final-report.md")
-        self.call("check-record", "--run-dir", str(self.run_dir), "--area", "frontend",
-                  "--name", "unit tests", "--status", "pass", "--evidence", "test output")
+        self.check_record("frontend")
+        for slot in (1, 2):
+            self.agent_result("code-review", "frontend", slot)
+        self.call("check", "--run-dir", str(self.run_dir), "--gate", "final", expected=1)
+        self.agent_result("code-review", "frontend", 3)
+        self.agent_results("qa", "frontend")
         self.call("check", "--run-dir", str(self.run_dir), "--gate", "final")
         self.assertFalse((self.run_dir / "backend-design.md").exists())
 
-    def test_user_review_requires_presentation_and_current_design_acceptance(self) -> None:
+    def test_user_review_requires_current_design_acceptance(self) -> None:
         self.init("frontend", "user-review")
         self.write("frontend-design.md", "first design\n")
         self.write("frontend-design-review.md")
-        self.call("review", "--run-dir", str(self.run_dir), "--area", "frontend", "--result", "clear")
+        self.reviews("frontend")
         self.call("check", "--run-dir", str(self.run_dir), "--gate", "design", expected=1)
         self.call("present", "--run-dir", str(self.run_dir), "--area", "frontend")
-        self.call("check", "--run-dir", str(self.run_dir), "--gate", "design", expected=1)
         self.call("accept-design", "--run-dir", str(self.run_dir), "--reference", "user approved draft")
         self.call("check", "--run-dir", str(self.run_dir), "--gate", "design")
         self.write("frontend-design.md", "revised design\n")
         self.call("check", "--run-dir", str(self.run_dir), "--gate", "design", expected=1)
         self.call("present", "--run-dir", str(self.run_dir), "--area", "frontend")
-        self.call("review", "--run-dir", str(self.run_dir), "--area", "frontend", "--result", "clear")
+        self.reviews("frontend")
         self.call("check", "--run-dir", str(self.run_dir), "--gate", "design", expected=1)
         self.call("accept-design", "--run-dir", str(self.run_dir), "--reference", "user approved revision")
         self.call("check", "--run-dir", str(self.run_dir), "--gate", "design")
 
-    def test_design_finding_needs_approval_and_new_clear_review(self) -> None:
+    def test_design_finding_requires_batch_approval_and_new_digest(self) -> None:
         self.init("backend")
         self.write("backend-design.md", "first design\n")
-        self.write("backend-design-review.md", "issue found\n")
-        self.call("review", "--run-dir", str(self.run_dir), "--area", "backend",
-                  "--result", "changes-required", "--finding", "missing error case")
+        self.write("backend-design-review.md")
+        self.review("backend", 1, "changes-required")
+        self.review("backend", 2)
+        self.call("approve", "--run-dir", str(self.run_dir), "--area", "backend",
+                  "--reference", "too early", expected=1)
+        self.review("backend", 3)
         self.call("check", "--run-dir", str(self.run_dir), "--gate", "design", expected=1)
-        self.write("backend-design.md", "revised before approval\n")
         self.call("approve", "--run-dir", str(self.run_dir), "--area", "backend",
-                  "--reference", "approval came too late", expected=1)
-        self.write("backend-design.md", "first design\n")
-        self.call("approve", "--run-dir", str(self.run_dir), "--area", "backend",
-                  "--reference", "user approved the error case revision")
+                  "--reference", "user approved all three findings")
+        self.reviews("backend")
+        self.call("check", "--run-dir", str(self.run_dir), "--gate", "design", expected=1)
         self.write("backend-design.md", "revised design\n")
-        self.call("check", "--run-dir", str(self.run_dir), "--gate", "design", expected=1)
-        self.call("review", "--run-dir", str(self.run_dir), "--area", "backend", "--result", "clear")
+        self.reviews("backend")
         self.call("check", "--run-dir", str(self.run_dir), "--gate", "design")
 
-    def test_both_scope_requires_contract_review_and_integration_qa(self) -> None:
+    def test_duplicate_agent_and_changed_artifact_are_rejected(self) -> None:
+        self.init("backend")
+        self.write("backend-design.md")
+        self.write("backend-design-review.md")
+        self.review("backend", 1, agent_id="/root/shared")
+        self.review("backend", 2, agent_id="/root/shared")
+        self.review("backend", 3)
+        self.call("check", "--run-dir", str(self.run_dir), "--gate", "design", expected=1)
+        self.review("backend", 2, agent_id="/root/unique")
+        self.call("check", "--run-dir", str(self.run_dir), "--gate", "design")
+        self.write("backend-design-review-2.md", "tampered\n")
+        self.call("check", "--run-dir", str(self.run_dir), "--gate", "design", expected=1)
+
+    def test_both_scope_requires_contract_and_integration_three_results(self) -> None:
         self.init("both")
         for area in ("frontend", "backend"):
             self.write(f"{area}-design.md")
             self.write(f"{area}-design-review.md")
-            self.call("review", "--run-dir", str(self.run_dir), "--area", area, "--result", "clear")
+            self.reviews(area)
         self.call("check", "--run-dir", str(self.run_dir), "--gate", "design", expected=1)
         self.write("integration-contract-review.md")
-        self.call("review", "--run-dir", str(self.run_dir), "--area", "integration", "--result", "clear")
+        self.reviews("integration")
         self.call("check", "--run-dir", str(self.run_dir), "--gate", "design")
         for area in ("frontend", "backend"):
             self.write(f"{area}-code-review.md")
             self.write(f"{area}-qa.md")
-            self.call("check-record", "--run-dir", str(self.run_dir), "--area", area,
-                      "--name", "tests", "--status", "pass", "--evidence", "test output")
-        self.write("final-report.md")
-        self.call("check", "--run-dir", str(self.run_dir), "--gate", "final", expected=1)
+            self.check_record(area)
+            self.agent_results("code-review", area)
+            self.agent_results("qa", area)
         self.write("integration-qa.md")
-        self.call("check-record", "--run-dir", str(self.run_dir), "--area", "integration",
-                  "--name", "contract test", "--status", "pass", "--evidence", "API response")
+        self.write("final-report.md")
+        self.check_record("integration")
+        self.call("check", "--run-dir", str(self.run_dir), "--gate", "final", expected=1)
+        self.agent_results("qa", "integration")
+        self.call("check", "--run-dir", str(self.run_dir), "--gate", "final")
+
+    def test_code_change_invalidates_reviews_qa_and_checks(self) -> None:
+        self.init("frontend")
+        self.write("frontend-design.md")
+        self.write("frontend-design-review.md")
+        self.reviews("frontend")
+        self.write("frontend-code-review.md")
+        self.write("frontend-qa.md")
+        self.write("final-report.md")
+        self.check_record("frontend")
+        self.agent_results("code-review", "frontend")
+        self.agent_results("qa", "frontend")
+        self.call("check", "--run-dir", str(self.run_dir), "--gate", "final")
+        (self.repo / "app.py").write_text("value = 2\n", encoding="utf-8")
+        self.call("check", "--run-dir", str(self.run_dir), "--gate", "final", expected=1)
+        self.check_record("frontend")
+        self.agent_results("code-review", "frontend")
+        self.agent_results("qa", "frontend")
+        self.call("check", "--run-dir", str(self.run_dir), "--gate", "final")
+
+    def test_design_change_invalidates_code_review_qa_and_checks(self) -> None:
+        self.init("frontend")
+        self.write("frontend-design.md", "design A\n")
+        self.write("frontend-design-review.md")
+        self.reviews("frontend")
+        self.write("frontend-code-review.md")
+        self.write("frontend-qa.md")
+        self.write("final-report.md")
+        self.check_record("frontend")
+        self.agent_results("code-review", "frontend")
+        self.agent_results("qa", "frontend")
+        self.call("check", "--run-dir", str(self.run_dir), "--gate", "final")
+        self.write("frontend-design.md", "design B\n")
+        self.reviews("frontend")
+        self.call("check", "--run-dir", str(self.run_dir), "--gate", "final", expected=1)
+        self.check_record("frontend")
+        self.agent_results("code-review", "frontend")
+        self.agent_results("qa", "frontend")
+        self.call("check", "--run-dir", str(self.run_dir), "--gate", "final")
+
+    def test_qa_failure_is_not_a_completed_gate(self) -> None:
+        self.init("frontend")
+        self.write("frontend-design.md")
+        self.write("frontend-design-review.md")
+        self.reviews("frontend")
+        self.write("frontend-code-review.md")
+        self.write("frontend-qa.md")
+        self.write("final-report.md")
+        self.check_record("frontend")
+        self.agent_results("code-review", "frontend")
+        self.agent_result("qa", "frontend", 1, "fail")
+        self.agent_result("qa", "frontend", 2)
+        self.agent_result("qa", "frontend", 3)
+        self.call("check", "--run-dir", str(self.run_dir), "--gate", "final", expected=1)
+        self.resolve_agent("qa", "frontend", 1)
+        self.agent_result("qa", "frontend", 1, "pass")
+        self.call("check", "--run-dir", str(self.run_dir), "--gate", "final")
+
+    def test_code_finding_requires_resolution_before_same_digest_rerun(self) -> None:
+        self.init("frontend")
+        self.write("frontend-design.md")
+        self.write("frontend-design-review.md")
+        self.reviews("frontend")
+        self.agent_result("code-review", "frontend", 1, "findings")
+        self.agent_result("code-review", "frontend", 2)
+        self.agent_result("code-review", "frontend", 3)
+        self.agent_result("code-review", "frontend", 1, "clear")
+        self.write("frontend-qa-1.md")
+        self.call("agent-result", "--run-dir", str(self.run_dir), "--stage", "qa",
+                  "--area", "frontend", "--slot", "1", "--agent-id", "/root/qa-one",
+                  "--result", "pass", expected=1)
+        self.agent_result("code-review", "frontend", 1, "findings")
+        self.resolve_agent("code-review", "frontend", 1)
+        self.agent_result("code-review", "frontend", 1, "clear")
+        self.agent_results("qa", "frontend")
+
+    def test_unborn_git_head_can_record_code_state(self) -> None:
+        empty_repo = self.base / "new-repo"
+        empty_repo.mkdir()
+        subprocess.run(["git", "-C", str(empty_repo), "init", "-q"], check=True)
+        (empty_repo / "new.py").write_text("value = 1\n", encoding="utf-8")
+        self.call("init", "--repo", str(empty_repo), "--scope", "frontend",
+                  "--review-mode", "immediate", "--mode-reference", "user answered",
+                  "--run-dir", str(self.run_dir))
+        self.write("frontend-design.md")
+        self.check_record("frontend")
+
+    def test_v2_run_remains_compatible(self) -> None:
+        self.init("frontend")
+        state_file = self.run_dir / "state.json"
+        state = json.loads(state_file.read_text(encoding="utf-8"))
+        state["version"] = 2
+        state_file.write_text(json.dumps(state), encoding="utf-8")
+        self.write("frontend-design.md")
+        self.write("frontend-design-review.md")
+        self.call("review", "--run-dir", str(self.run_dir), "--area", "frontend", "--result", "clear")
+        self.call("check", "--run-dir", str(self.run_dir), "--gate", "design")
+        self.write("frontend-code-review.md")
+        self.write("frontend-qa.md")
+        self.write("final-report.md")
+        self.check_record("frontend")
         self.call("check", "--run-dir", str(self.run_dir), "--gate", "final")
 
     def test_run_directory_cannot_be_inside_git_repo(self) -> None:
@@ -143,20 +307,20 @@ class WorkflowHarnessTest(unittest.TestCase):
         outside = self.repo / "design.md"
         outside.write_text("should stay outside the repo\n", encoding="utf-8")
         (self.run_dir / "frontend-design.md").symlink_to(outside)
-        self.write("frontend-design-review.md")
+        self.write("frontend-design-review-1.md")
         result = self.call("review", "--run-dir", str(self.run_dir), "--area", "frontend",
-                           "--result", "clear", expected=1)
+                           "--slot", "1", "--agent-id", "/root/one", "--result", "clear", expected=1)
         self.assertIn("artifact must be a local file", result.stderr)
 
     def test_scope_aware_plan(self) -> None:
         frontend = {task["id"] for task in build_plan("frontend")}
         both = {task["id"] for task in build_plan("both")}
-        self.assertIn("qa-frontend", frontend)
-        self.assertNotIn("qa-backend", frontend)
-        self.assertNotIn("review-contract", frontend)
-        self.assertIn("qa-backend", both)
-        self.assertIn("review-contract", both)
-        self.assertIn("qa-integration", both)
+        self.assertIn("qa-frontend-3", frontend)
+        self.assertNotIn("qa-backend-1", frontend)
+        self.assertNotIn("review-contract-1", frontend)
+        self.assertIn("qa-backend-3", both)
+        self.assertIn("review-contract-3", both)
+        self.assertIn("qa-integration-3", both)
         reviewed = {task["id"] for task in build_plan("both", "user-review")}
         self.assertIn("present-design-frontend", reviewed)
         self.assertIn("present-design-backend", reviewed)
