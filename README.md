@@ -6,7 +6,7 @@
 
 질문 UI가 해당 환경과 질문 유형에 제공되면 선택지와 자유 입력을 우선 사용합니다. `질문 답하기`와 같은 버튼의 표시 방식은 Codex 클라이언트가 결정합니다. 스킬과 훅은 버튼을 직접 생성하거나 기록된 서브에이전트 ID의 실존성을 검증하지 못합니다.
 
-설계·QA 리포트는 기본적으로 `~/.codex/implementation-workflow-runs/` 아래 작업별 폴더에만 저장합니다. 이 폴더는 대상 Git 저장소 밖의 로컬 경로여야 합니다. `scripts/guard_documents.py`는 Git 변경에서 `README.md`를 제외한 문서 파일을 검사합니다. Markdown, 텍스트, PDF, Word 등 일반 문서 확장자와 `docs/`·`documentation/`·`design-docs/`·`reports/` 아래 파일을 차단합니다.
+설계·검토·QA 리포트는 기본적으로 `~/Documents/docs/<저장소>/<브랜치>/<작업 항목>/<실행>` 폴더에 저장합니다. 작업 항목을 지정하지 않으면 브랜치 아래에 실행 폴더를 만듭니다. 같은 저장소·브랜치·작업 항목 폴더는 재사용하고 실행 폴더는 새로 만들어 기존 문서를 덮어쓰지 않습니다. 기존에 사람이 만든 폴더는 현재 작업의 폴더임을 확인한 뒤 `--parent-dir`로 지정할 수 있습니다. 대상 Git 저장소와 다른 Git 저장소 내부 경로는 거부합니다. 기존 `~/.codex/implementation-workflow-runs/`의 v2·v3 실행 기록은 후속 명령에서 계속 읽을 수 있지만 새 실행은 그곳에 만들지 않습니다. 플러그인은 문서를 업로드하지 않으며 `~/Documents`의 운영체제 클라우드 동기화 설정까지 제어하지는 않습니다. `scripts/guard_documents.py`는 Git 변경에서 `README.md`를 제외한 문서 파일을 검사합니다. Markdown, 텍스트, PDF, Word 등 일반 문서 확장자와 `docs/`·`documentation/`·`design-docs/`·`reports/` 아래 파일을 차단합니다.
 
 Git 훅은 개발자 컴퓨터에서 우회할 수 있으므로 원격 푸시·병합 금지를 완성하려면 GitHub 저장소 또는 조직의 push ruleset과 필수 상태 검사가 필요합니다. GitHub 원격 규칙은 이 플러그인 설치만으로 자동 배포되지 않습니다.
 

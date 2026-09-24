@@ -7,6 +7,7 @@ import argparse
 import hashlib
 import json
 import os
+import re
 import subprocess
 import sys
 import uuid
@@ -33,25 +34,68 @@ def within(path: Path, parent: Path) -> bool:
     return path == parent or parent in path.parents
 
 
-def ensure_local_run_dir(run_dir: Path, repo_root: Path) -> None:
-    resolved = run_dir.resolve()
-    base = (Path.home() / ".codex" / "implementation-workflow-runs").resolve()
-    if not within(resolved, base):
-        raise ValueError("run directory must be under ~/.codex/implementation-workflow-runs")
-    if within(resolved, repo_root.resolve()):
+def lexical_absolute(path: Path) -> Path:
+    return Path(os.path.abspath(path))
+
+
+def docs_base() -> Path:
+    return Path.home() / "Documents" / "docs"
+
+
+def legacy_base() -> Path:
+    return Path.home() / ".codex" / "implementation-workflow-runs"
+
+
+def ensure_local_run_dir(run_dir: Path, repo_root: Path, allow_legacy: bool = False) -> None:
+    path = lexical_absolute(run_dir)
+    bases = [docs_base()]
+    if allow_legacy:
+        bases.append(legacy_base())
+    resolved_path = path.resolve()
+    matching_base = next((base for base in bases
+                          if resolved_path != base.resolve()
+                          and within(resolved_path, base.resolve())), None)
+    if matching_base is None:
+        raise ValueError("run directory must be under ~/Documents/docs"
+                         + (" or an existing legacy run" if allow_legacy else ""))
+    home = lexical_absolute(Path.home())
+    resolved_home = home.resolve()
+    home_ancestors = {home, *home.parents, resolved_home, *resolved_home.parents}
+    input_parents = {path, *path.parents, matching_base, *matching_base.parents}
+    if any(parent.is_symlink() for parent in input_parents if parent not in home_ancestors):
+        raise ValueError("run directory must not contain a symbolic link")
+    if within(resolved_path, repo_root.resolve()):
         raise ValueError("run directory must be outside the target Git repository")
-    if any((parent / ".git").exists() for parent in (resolved, *resolved.parents)):
+    if any((parent / ".git").exists() for parent in
+           {path, *path.parents, resolved_path, *resolved_path.parents}):
         raise ValueError("run directory must not be inside any Git repository")
 
 
-def default_run_dir(repo_root: Path) -> Path:
+def directory_id(name: str, identity: str) -> str:
+    readable = re.sub(r"[^\w.-]+", "-", name, flags=re.UNICODE).strip("._-")[:48] or "item"
+    return f"{readable}-{hashlib.sha256(identity.encode('utf-8')).hexdigest()[:8]}"
+
+
+def default_run_dir(repo_root: Path, work_item: str | None = None,
+                    parent_dir: Path | None = None) -> Path:
     timestamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
-    return Path.home() / ".codex" / "implementation-workflow-runs" / f"{repo_root.name}-{timestamp}-{uuid.uuid4().hex[:6]}"
+    if parent_dir is None:
+        origin = subprocess.run(["git", "-C", str(repo_root), "config", "--get", "remote.origin.url"],
+                                capture_output=True, text=True).stdout.strip()
+        branch = subprocess.run(["git", "-C", str(repo_root), "symbolic-ref", "--quiet", "--short", "HEAD"],
+                                capture_output=True, text=True).stdout.strip()
+        if not branch:
+            branch = "detached-" + git_output(repo_root, "rev-parse", "--short", "HEAD").decode().strip()
+        parent_dir = (docs_base() / directory_id(repo_root.name, origin or str(repo_root))
+                      / directory_id(branch, branch))
+        if work_item is not None:
+            parent_dir /= directory_id(work_item, work_item)
+    return parent_dir / f"run-{timestamp}-{uuid.uuid4().hex[:6]}"
 
 
 def read_state(run_dir: Path) -> dict:
     state = json.loads((run_dir / "state.json").read_text(encoding="utf-8"))
-    ensure_local_run_dir(run_dir, Path(state["repo_root"]))
+    ensure_local_run_dir(run_dir, Path(state["repo_root"]), allow_legacy=True)
     if state.get("version") not in (2, 3):
         raise ValueError("unsupported workflow state version")
     return state
@@ -291,6 +335,9 @@ def main() -> int:
     initialize.add_argument("--mode-reference", required=True,
                             help="Reference to the user's answer for this implementation request")
     initialize.add_argument("--run-dir", type=Path)
+    initialize.add_argument("--parent-dir", type=Path,
+                            help="Existing branch or work folder under ~/Documents/docs")
+    initialize.add_argument("--work-item", help="Stable name for the current work item")
     for command in ("present", "review", "approve", "accept-design", "agent-result", "resolve-agent", "check-record", "check"):
         sub = commands.add_parser(command)
         sub.add_argument("--run-dir", type=Path, required=True)
@@ -324,12 +371,26 @@ def main() -> int:
         if args.command == "init":
             if not args.mode_reference.strip():
                 raise ValueError("--mode-reference must identify the user's answer for this request")
+            if args.run_dir and args.parent_dir:
+                raise ValueError("--run-dir and --parent-dir cannot be used together")
+            if args.work_item is not None and (args.run_dir or args.parent_dir):
+                raise ValueError("--work-item cannot be combined with --run-dir or --parent-dir")
+            if args.work_item is not None and (not args.work_item.strip()
+                    or args.work_item in {".", ".."}
+                    or any(separator in args.work_item for separator in ("/", "\\"))):
+                raise ValueError("--work-item must be a single nonempty folder name")
             repo_root = args.repo.resolve()
             if not (repo_root / ".git").exists():
                 raise ValueError("--repo must be a Git checkout")
-            run_dir = (args.run_dir or default_run_dir(repo_root)).resolve()
+            if args.parent_dir:
+                ensure_local_run_dir(args.parent_dir, repo_root)
+                if not args.parent_dir.is_dir():
+                    raise ValueError("--parent-dir must be an existing folder")
+            run_dir = args.run_dir or default_run_dir(repo_root, args.work_item, args.parent_dir)
             ensure_local_run_dir(run_dir, repo_root)
+            run_dir = lexical_absolute(run_dir)
             run_dir.mkdir(parents=True, exist_ok=False)
+            ensure_local_run_dir(run_dir, repo_root)
             run_dir.chmod(0o700)
             write_state(run_dir, {"version": 3, "repo_root": str(repo_root), "scope": args.scope,
                                   "review_mode": args.review_mode,
@@ -337,7 +398,7 @@ def main() -> int:
             print(run_dir)
             return 0
 
-        run_dir = args.run_dir.resolve()
+        run_dir = lexical_absolute(args.run_dir)
         state = read_state(run_dir)
         if args.command in {"present", "review", "approve", "agent-result", "resolve-agent", "check-record"} and args.area not in review_areas(state["scope"]):
             raise ValueError(f"area {args.area} is outside the {state['scope']} scope")

@@ -27,7 +27,7 @@ python3 <plugin-root>/scripts/orchestrate.py --scope both --review-mode <immedia
 ## 로컬 하네스 게이트
 
 ```sh
-python3 <plugin-root>/scripts/workflow_harness.py init --repo <target-repo> --scope <frontend|backend|both> --review-mode <immediate|user-review> --mode-reference <user-answer-for-this-request>
+python3 <plugin-root>/scripts/workflow_harness.py init --repo <target-repo> --scope <frontend|backend|both> --review-mode <immediate|user-review> --mode-reference <user-answer-for-this-request> [--work-item <stable-task-name> | --parent-dir <existing-docs-folder> | --run-dir <new-docs-run-folder>]
 python3 <plugin-root>/scripts/workflow_harness.py present --run-dir <local-run-dir> --area <frontend|backend>
 python3 <plugin-root>/scripts/workflow_harness.py review --run-dir <local-run-dir> --area <area> --slot <1|2|3> --agent-id <actual-subagent-id> --result <clear|changes-required> [--finding <summary>]
 python3 <plugin-root>/scripts/workflow_harness.py approve --run-dir <local-run-dir> --area <area> --reference <actual-user-approval>

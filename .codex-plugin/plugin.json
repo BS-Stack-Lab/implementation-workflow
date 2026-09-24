@@ -1,6 +1,6 @@
 {
   "name": "implementation-workflow",
-  "version": "0.3.0",
+  "version": "0.4.0",
   "description": "문서 기반 구현을 세 명의 독립 설계·코드 검토자와 QA 담당자로 진행하는 Codex 스킬, 훅, 하네스와 오케스트라",
   "author": {
     "name": "BS-Stack-Lab",

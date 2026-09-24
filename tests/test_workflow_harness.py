@@ -15,13 +15,14 @@ ROOT = Path(__file__).resolve().parents[1]
 HARNESS = ROOT / "scripts" / "workflow_harness.py"
 sys.path.insert(0, str(ROOT / "scripts"))
 from orchestrate import build_plan  # noqa: E402
+from workflow_harness import directory_id  # noqa: E402
 
 
 class WorkflowHarnessTest(unittest.TestCase):
     def setUp(self) -> None:
         self.temporary = tempfile.TemporaryDirectory()
         self.addCleanup(self.temporary.cleanup)
-        self.base = Path(self.temporary.name)
+        self.base = Path(self.temporary.name).resolve()
         self.repo = self.base / "target-repo"
         self.repo.mkdir()
         subprocess.run(["git", "-C", str(self.repo), "init", "-q"], check=True)
@@ -30,7 +31,8 @@ class WorkflowHarnessTest(unittest.TestCase):
         subprocess.run(["git", "-C", str(self.repo), "-c", "core.hooksPath=/dev/null",
                         "-c", "user.name=Test", "-c", "user.email=test@example.test",
                         "commit", "-qm", "initial"], check=True)
-        self.run_dir = self.base / ".codex" / "implementation-workflow-runs" / "one"
+        self.docs = self.base / "Documents" / "docs"
+        self.run_dir = self.docs / "one"
 
     def call(self, *args: str, expected: int = 0) -> subprocess.CompletedProcess[str]:
         result = subprocess.run([sys.executable, str(HARNESS), *args], capture_output=True,
@@ -288,8 +290,22 @@ class WorkflowHarnessTest(unittest.TestCase):
         self.check_record("frontend")
         self.call("check", "--run-dir", str(self.run_dir), "--gate", "final")
 
+    def test_existing_legacy_run_can_continue_but_not_be_initialized(self) -> None:
+        self.init("frontend")
+        legacy = self.base / ".codex" / "implementation-workflow-runs" / "old-run"
+        legacy.parent.mkdir(parents=True)
+        self.run_dir.rename(legacy)
+        self.run_dir = legacy
+        self.write("frontend-design.md")
+        self.write("frontend-design-review.md")
+        self.reviews("frontend")
+        self.call("check", "--run-dir", str(self.run_dir), "--gate", "design")
+        self.call("init", "--repo", str(self.repo), "--scope", "frontend",
+                  "--review-mode", "immediate", "--mode-reference", "new answer",
+                  "--run-dir", str(legacy.parent / "new-run"), expected=1)
+
     def test_run_directory_cannot_be_inside_git_repo(self) -> None:
-        nested_repo = self.base / ".codex" / "implementation-workflow-runs" / "nested-repo"
+        nested_repo = self.docs / "nested-repo"
         (nested_repo / ".git").mkdir(parents=True)
         result = self.call("init", "--repo", str(nested_repo), "--scope", "frontend",
                            "--review-mode", "immediate", "--mode-reference", "user answered",
@@ -300,7 +316,122 @@ class WorkflowHarnessTest(unittest.TestCase):
         result = self.call("init", "--repo", str(self.repo), "--scope", "backend",
                            "--review-mode", "immediate", "--mode-reference", "user answered",
                            "--run-dir", str(self.base / "Dropbox" / "run"), expected=1)
-        self.assertIn("under ~/.codex/implementation-workflow-runs", result.stderr)
+        self.assertIn("under ~/Documents/docs", result.stderr)
+
+    def test_default_run_uses_repository_branch_and_work_folders(self) -> None:
+        first = Path(self.call("init", "--repo", str(self.repo), "--scope", "frontend",
+                               "--review-mode", "immediate", "--mode-reference", "answer",
+                               "--work-item", "profile page").stdout.strip())
+        second = Path(self.call("init", "--repo", str(self.repo), "--scope", "frontend",
+                                "--review-mode", "immediate", "--mode-reference", "answer",
+                                "--work-item", "profile page").stdout.strip())
+        self.assertEqual(first.parent, second.parent)
+        self.assertNotEqual(first, second)
+        self.assertEqual(first.parents[3], self.docs)
+        self.assertTrue(first.name.startswith("run-"))
+        self.assertTrue((first / "state.json").exists())
+
+    def test_directory_ids_distinguish_similar_names(self) -> None:
+        self.assertNotEqual(directory_id("feature/a", "feature/a"),
+                            directory_id("feature-a", "feature-a"))
+        self.assertNotEqual(directory_id("project", "https://example.test/a/project"),
+                            directory_id("project", "https://example.test/b/project"))
+
+    def test_existing_manual_folder_is_reused_without_overwriting(self) -> None:
+        parent = self.docs / "manual-project" / "feat-profile"
+        parent.mkdir(parents=True)
+        (parent / "old-design.md").write_text("keep\n", encoding="utf-8")
+        run = Path(self.call("init", "--repo", str(self.repo), "--scope", "frontend",
+                             "--review-mode", "immediate", "--mode-reference", "answer",
+                             "--parent-dir", str(parent)).stdout.strip())
+        self.assertEqual(run.parent, parent)
+        self.assertEqual((parent / "old-design.md").read_text(), "keep\n")
+
+    def test_relative_run_dir_is_reported_as_absolute(self) -> None:
+        relative = Path(os.path.relpath(self.docs / "relative-run", Path.cwd()))
+        run = Path(self.call("init", "--repo", str(self.repo), "--scope", "frontend",
+                             "--review-mode", "immediate", "--mode-reference", "answer",
+                             "--run-dir", str(relative)).stdout.strip())
+        self.assertTrue(run.is_absolute())
+        self.assertEqual(run, self.docs / "relative-run")
+
+    def test_folder_arguments_reject_escape_and_ambiguity(self) -> None:
+        for item in ("", "..", "a/b", "a\\b"):
+            self.call("init", "--repo", str(self.repo), "--scope", "frontend",
+                      "--review-mode", "immediate", "--mode-reference", "answer",
+                      "--work-item", item, expected=1)
+        outside = self.base / "outside"
+        outside.mkdir()
+        self.call("init", "--repo", str(self.repo), "--scope", "frontend",
+                  "--review-mode", "immediate", "--mode-reference", "answer",
+                  "--parent-dir", str(outside), expected=1)
+        self.call("init", "--repo", str(self.repo), "--scope", "frontend",
+                  "--review-mode", "immediate", "--mode-reference", "answer",
+                  "--parent-dir", str(self.docs / "missing"), expected=1)
+        self.call("init", "--repo", str(self.repo), "--scope", "frontend",
+                  "--review-mode", "immediate", "--mode-reference", "answer",
+                  "--parent-dir", str(outside), "--run-dir", str(self.run_dir), expected=1)
+        self.call("init", "--repo", str(self.repo), "--scope", "frontend",
+                  "--review-mode", "immediate", "--mode-reference", "answer",
+                  "--parent-dir", str(self.docs), expected=1)
+
+    def test_symlink_and_git_worktree_folder_are_rejected(self) -> None:
+        self.docs.mkdir(parents=True)
+        outside = self.base / "outside"
+        outside.mkdir()
+        (self.docs / "linked").symlink_to(outside, target_is_directory=True)
+        self.call("init", "--repo", str(self.repo), "--scope", "frontend",
+                  "--review-mode", "immediate", "--mode-reference", "answer",
+                  "--parent-dir", str(self.docs / "linked"), expected=1)
+        outside_link = self.base / "outside-link"
+        outside_link.symlink_to(self.docs, target_is_directory=True)
+        self.call("init", "--repo", str(self.repo), "--scope", "frontend",
+                  "--review-mode", "immediate", "--mode-reference", "answer",
+                  "--run-dir", str(outside_link / "run"), expected=1)
+        worktree = self.docs / "worktree"
+        worktree.mkdir()
+        (worktree / ".git").write_text("gitdir: elsewhere\n", encoding="utf-8")
+        self.call("init", "--repo", str(self.repo), "--scope", "frontend",
+                  "--review-mode", "immediate", "--mode-reference", "answer",
+                  "--parent-dir", str(worktree), expected=1)
+
+    def test_symlink_to_existing_run_is_rejected_for_followup(self) -> None:
+        self.init("frontend")
+        linked = self.docs / "linked-run"
+        linked.symlink_to(self.run_dir, target_is_directory=True)
+        self.call("check", "--run-dir", str(linked), "--gate", "design", expected=1)
+
+    def test_system_symlink_above_home_does_not_block_docs(self) -> None:
+        actual = self.base / "actual"
+        home = actual / "home"
+        home.mkdir(parents=True)
+        alias = self.base / "alias"
+        alias.symlink_to(actual, target_is_directory=True)
+        result = subprocess.run(
+            [sys.executable, str(HARNESS), "init", "--repo", str(self.repo),
+             "--scope", "frontend", "--review-mode", "immediate",
+             "--mode-reference", "answer"],
+            capture_output=True, text=True, env={**os.environ, "HOME": str(alias / "home")})
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertTrue(Path(result.stdout.strip()).is_dir())
+        app = home / "app"
+        app.mkdir()
+        relative = subprocess.run(
+            [sys.executable, str(HARNESS), "init", "--repo", str(self.repo),
+             "--scope", "frontend", "--review-mode", "immediate",
+             "--mode-reference", "answer", "--run-dir", "../Documents/docs/relative-run"],
+            cwd=alias / "home" / "app", capture_output=True, text=True,
+            env={**os.environ, "HOME": str(alias / "home")})
+        self.assertEqual(relative.returncode, 0, relative.stderr)
+        self.assertTrue(Path(relative.stdout.strip()).is_absolute())
+        physical = subprocess.run(
+            [sys.executable, str(HARNESS), "init", "--repo", str(self.repo),
+             "--scope", "frontend", "--review-mode", "immediate",
+             "--mode-reference", "answer", "--run-dir",
+             str(home / "Documents" / "docs" / "physical-run")],
+            capture_output=True, text=True,
+            env={**os.environ, "HOME": str(alias / "home")})
+        self.assertEqual(physical.returncode, 0, physical.stderr)
 
     def test_artifact_symlink_to_repository_is_rejected(self) -> None:
         self.init("frontend")

@@ -60,8 +60,9 @@ def main() -> None:
                 "Use a supported question UI with choices and free text when available. "
                 "Use three distinct subagents for each design review, code review, "
                 "and QA stage. Follow the design-review approval gate. "
-                "Keep generated design and QA "
-                "documents outside the target Git repository."
+                "Keep generated design, review, and QA documents under "
+                "~/Documents/docs in the matching branch or work folder, outside Git. "
+                "Reuse an existing matching folder when one is identified."
             ),
         }
     }, ensure_ascii=False))
