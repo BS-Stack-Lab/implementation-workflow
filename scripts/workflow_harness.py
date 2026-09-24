@@ -78,15 +78,21 @@ def require_artifact(run_dir: Path, name: str) -> None:
         raise ValueError(f"missing or empty artifact: {name}")
 
 
-def check_design(run_dir: Path, state: dict) -> None:
+def check_reviews(run_dir: Path, state: dict) -> None:
     for area in areas_for(state["scope"]):
         require_artifact(run_dir, f"{area}-design.md")
         require_artifact(run_dir, f"{area}-design-review.md")
+        digest = design_digest(run_dir, area)
+        if state["review_mode"] == "user-review" and not any(
+            event["type"] == "present" and event["area"] == area and event["digest"] == digest
+            for event in state["events"]
+        ):
+            raise ValueError(f"current design has not been presented to the user: {area}")
     if state["scope"] == "both":
         require_artifact(run_dir, "integration-contract-review.md")
 
     for area in review_areas(state["scope"]):
-        events = [event for event in state["events"] if event["area"] == area]
+        events = [event for event in state["events"] if event.get("area") == area]
         reviews = [(index, event) for index, event in enumerate(events) if event["type"] == "review"]
         if not reviews:
             raise ValueError(f"missing design review event: {area}")
@@ -99,6 +105,15 @@ def check_design(run_dir: Path, state: dict) -> None:
         _, latest = reviews[-1]
         if latest["result"] != "clear" or latest["digest"] != design_digest(run_dir, area):
             raise ValueError(f"current design needs a clear review: {area}")
+
+
+def check_design(run_dir: Path, state: dict) -> None:
+    check_reviews(run_dir, state)
+    if state["review_mode"] == "user-review":
+        digests = {area: design_digest(run_dir, area) for area in areas_for(state["scope"])}
+        if not any(event["type"] == "accept-design" and event["digests"] == digests
+                   for event in state["events"]):
+            raise ValueError("current design awaits the user's explicit acceptance")
 
 
 def check_final(run_dir: Path, state: dict) -> None:
@@ -126,22 +141,23 @@ def main() -> int:
     initialize = commands.add_parser("init")
     initialize.add_argument("--repo", type=Path, required=True)
     initialize.add_argument("--scope", choices=("frontend", "backend", "both"), required=True)
+    initialize.add_argument("--review-mode", choices=("immediate", "user-review"), required=True)
     initialize.add_argument("--run-dir", type=Path)
-    for command in ("review", "approve", "check-record", "check"):
+    for command in ("present", "review", "approve", "accept-design", "check-record", "check"):
         sub = commands.add_parser(command)
         sub.add_argument("--run-dir", type=Path, required=True)
-        if command in {"review", "approve", "check-record"}:
+        if command in {"present", "review", "approve", "check-record"}:
             sub.add_argument("--area", choices=("frontend", "backend", "integration"), required=True)
         if command == "review":
             sub.add_argument("--result", choices=("clear", "changes-required"), required=True)
             sub.add_argument("--finding", default="")
-        elif command == "approve":
+        elif command in {"approve", "accept-design"}:
             sub.add_argument("--reference", required=True, help="Reference to the user's actual approval")
         elif command == "check-record":
             sub.add_argument("--name", required=True)
             sub.add_argument("--status", choices=("pass", "fail", "not-run"), required=True)
             sub.add_argument("--evidence", required=True)
-        else:
+        elif command == "check":
             sub.add_argument("--gate", choices=("design", "final"), required=True)
     args = parser.parse_args()
 
@@ -154,15 +170,24 @@ def main() -> int:
             ensure_local_run_dir(run_dir, repo_root)
             run_dir.mkdir(parents=True, exist_ok=False)
             run_dir.chmod(0o700)
-            write_state(run_dir, {"version": 1, "repo_root": str(repo_root), "scope": args.scope, "events": []})
+            write_state(run_dir, {"version": 2, "repo_root": str(repo_root), "scope": args.scope,
+                                  "review_mode": args.review_mode, "events": []})
             print(run_dir)
             return 0
 
         run_dir = args.run_dir.resolve()
         state = read_state(run_dir)
-        if args.command in {"review", "approve", "check-record"} and args.area not in review_areas(state["scope"]):
+        if args.command in {"present", "review", "approve", "check-record"} and args.area not in review_areas(state["scope"]):
             raise ValueError(f"area {args.area} is outside the {state['scope']} scope")
-        if args.command == "review":
+        if args.command == "present":
+            if state["review_mode"] != "user-review":
+                raise ValueError("present is only required in user-review mode")
+            if args.area == "integration":
+                raise ValueError("present each design document separately")
+            state["events"].append({"type": "present", "area": args.area,
+                                    "digest": design_digest(run_dir, args.area)})
+            write_state(run_dir, state)
+        elif args.command == "review":
             if args.result == "changes-required" and not args.finding.strip():
                 raise ValueError("--finding is required for changes-required review")
             review_file = f"{args.area}-design-review.md" if args.area != "integration" else "integration-contract-review.md"
@@ -173,7 +198,7 @@ def main() -> int:
         elif args.command == "approve":
             if not args.reference.strip():
                 raise ValueError("approval reference cannot be empty")
-            events = [event for event in state["events"] if event["area"] == args.area]
+            events = [event for event in state["events"] if event.get("area") == args.area]
             last_review_index = next((index for index in range(len(events) - 1, -1, -1)
                                       if events[index]["type"] == "review"), None)
             last_review = events[last_review_index] if last_review_index is not None else None
@@ -185,6 +210,16 @@ def main() -> int:
                 raise ValueError("design changed before user approval; restore the reviewed version")
             state["events"].append({"type": "approval", "area": args.area,
                                     "reference": args.reference, "digest": last_review["digest"]})
+            write_state(run_dir, state)
+        elif args.command == "accept-design":
+            if state["review_mode"] != "user-review":
+                raise ValueError("accept-design is only required in user-review mode")
+            if not args.reference.strip():
+                raise ValueError("acceptance reference cannot be empty")
+            check_reviews(run_dir, state)
+            state["events"].append({"type": "accept-design", "reference": args.reference,
+                                    "digests": {area: design_digest(run_dir, area)
+                                                for area in areas_for(state["scope"])}})
             write_state(run_dir, state)
         elif args.command == "check-record":
             if not args.name.strip() or not args.evidence.strip():

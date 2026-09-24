@@ -31,8 +31,9 @@ class WorkflowHarnessTest(unittest.TestCase):
         self.assertEqual(result.returncode, expected, result.stdout + result.stderr)
         return result
 
-    def init(self, scope: str) -> None:
-        self.call("init", "--repo", str(self.repo), "--scope", scope, "--run-dir", str(self.run_dir))
+    def init(self, scope: str, review_mode: str = "immediate") -> None:
+        self.call("init", "--repo", str(self.repo), "--scope", scope,
+                  "--review-mode", review_mode, "--run-dir", str(self.run_dir))
 
     def write(self, name: str, content: str = "evidence\n") -> None:
         (self.run_dir / name).write_text(content, encoding="utf-8")
@@ -53,6 +54,24 @@ class WorkflowHarnessTest(unittest.TestCase):
                   "--name", "unit tests", "--status", "pass", "--evidence", "test output")
         self.call("check", "--run-dir", str(self.run_dir), "--gate", "final")
         self.assertFalse((self.run_dir / "backend-design.md").exists())
+
+    def test_user_review_requires_presentation_and_current_design_acceptance(self) -> None:
+        self.init("frontend", "user-review")
+        self.write("frontend-design.md", "first design\n")
+        self.write("frontend-design-review.md")
+        self.call("review", "--run-dir", str(self.run_dir), "--area", "frontend", "--result", "clear")
+        self.call("check", "--run-dir", str(self.run_dir), "--gate", "design", expected=1)
+        self.call("present", "--run-dir", str(self.run_dir), "--area", "frontend")
+        self.call("check", "--run-dir", str(self.run_dir), "--gate", "design", expected=1)
+        self.call("accept-design", "--run-dir", str(self.run_dir), "--reference", "user approved draft")
+        self.call("check", "--run-dir", str(self.run_dir), "--gate", "design")
+        self.write("frontend-design.md", "revised design\n")
+        self.call("check", "--run-dir", str(self.run_dir), "--gate", "design", expected=1)
+        self.call("present", "--run-dir", str(self.run_dir), "--area", "frontend")
+        self.call("review", "--run-dir", str(self.run_dir), "--area", "frontend", "--result", "clear")
+        self.call("check", "--run-dir", str(self.run_dir), "--gate", "design", expected=1)
+        self.call("accept-design", "--run-dir", str(self.run_dir), "--reference", "user approved revision")
+        self.call("check", "--run-dir", str(self.run_dir), "--gate", "design")
 
     def test_design_finding_needs_approval_and_new_clear_review(self) -> None:
         self.init("backend")
@@ -98,11 +117,13 @@ class WorkflowHarnessTest(unittest.TestCase):
         nested_repo = self.base / ".codex" / "implementation-workflow-runs" / "nested-repo"
         (nested_repo / ".git").mkdir(parents=True)
         result = self.call("init", "--repo", str(nested_repo), "--scope", "frontend",
+                           "--review-mode", "immediate",
                            "--run-dir", str(nested_repo / "reports"), expected=1)
         self.assertIn("outside the target Git repository", result.stderr)
 
     def test_run_directory_must_use_local_base(self) -> None:
         result = self.call("init", "--repo", str(self.repo), "--scope", "backend",
+                           "--review-mode", "immediate",
                            "--run-dir", str(self.base / "Dropbox" / "run"), expected=1)
         self.assertIn("under ~/.codex/implementation-workflow-runs", result.stderr)
 
@@ -125,6 +146,10 @@ class WorkflowHarnessTest(unittest.TestCase):
         self.assertIn("qa-backend", both)
         self.assertIn("review-contract", both)
         self.assertIn("qa-integration", both)
+        reviewed = {task["id"] for task in build_plan("both", "user-review")}
+        self.assertIn("present-design-frontend", reviewed)
+        self.assertIn("present-design-backend", reviewed)
+        self.assertIn("accept-design", reviewed)
 
 
 if __name__ == "__main__":

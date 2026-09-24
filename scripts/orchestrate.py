@@ -7,9 +7,11 @@ import argparse
 import json
 
 
-def build_plan(scope: str) -> list[dict[str, object]]:
+def build_plan(scope: str, review_mode: str = "immediate") -> list[dict[str, object]]:
     if scope not in {"frontend", "backend", "both"}:
         raise ValueError(f"unsupported scope: {scope}")
+    if review_mode not in {"immediate", "user-review"}:
+        raise ValueError(f"unsupported review mode: {review_mode}")
 
     areas = ["frontend", "backend"] if scope == "both" else [scope]
     tasks: list[dict[str, object]] = [
@@ -17,11 +19,20 @@ def build_plan(scope: str) -> list[dict[str, object]]:
     ]
     for area in areas:
         tasks.append({"id": f"design-{area}", "role": f"{area}-designer", "depends_on": ["intake"]})
-        tasks.append({"id": f"review-design-{area}", "role": f"{area}-design-reviewer", "depends_on": [f"design-{area}"]})
+        design_dependency = f"design-{area}"
+        if review_mode == "user-review":
+            tasks.append({"id": f"present-design-{area}", "role": "coordinator",
+                          "depends_on": [design_dependency]})
+            design_dependency = f"present-design-{area}"
+        tasks.append({"id": f"review-design-{area}", "role": f"{area}-design-reviewer",
+                      "depends_on": [design_dependency]})
     design_reviews = [f"review-design-{area}" for area in areas]
     if scope == "both":
         tasks.append({"id": "review-contract", "role": "contract-reviewer", "depends_on": design_reviews})
         design_reviews = ["review-contract"]
+    if review_mode == "user-review":
+        tasks.append({"id": "accept-design", "role": "user", "depends_on": design_reviews})
+        design_reviews = ["accept-design"]
     tasks.append({"id": "approval-gate", "role": "coordinator", "depends_on": design_reviews})
     for area in areas:
         tasks.append({"id": f"implement-{area}", "role": f"{area}-implementer", "depends_on": ["approval-gate"]})
@@ -39,8 +50,9 @@ def build_plan(scope: str) -> list[dict[str, object]]:
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--scope", choices=("frontend", "backend", "both"), required=True)
+    parser.add_argument("--review-mode", choices=("immediate", "user-review"), required=True)
     args = parser.parse_args()
-    print(json.dumps(build_plan(args.scope), ensure_ascii=False, indent=2))
+    print(json.dumps(build_plan(args.scope, args.review_mode), ensure_ascii=False, indent=2))
 
 
 if __name__ == "__main__":
