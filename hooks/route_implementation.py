@@ -52,6 +52,11 @@ def main() -> None:
             "additionalContext": (
                 "For this code implementation request, load the "
                 "implementation-workflow skill before changing code. "
+                "At the start of EVERY new implementation request, ask the user "
+                "to choose one of two design review modes: (1) implement after "
+                "independent design review, or (2) let the user review the design "
+                "before implementation. Wait for an explicit answer. Never reuse "
+                "a choice from an earlier request or infer it from context. "
                 "Follow its design-review approval gate and independent "
                 "subagent review steps. Keep generated design and QA "
                 "documents outside the target Git repository."

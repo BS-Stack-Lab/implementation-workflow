@@ -33,7 +33,18 @@ class WorkflowHarnessTest(unittest.TestCase):
 
     def init(self, scope: str, review_mode: str = "immediate") -> None:
         self.call("init", "--repo", str(self.repo), "--scope", scope,
-                  "--review-mode", review_mode, "--run-dir", str(self.run_dir))
+                  "--review-mode", review_mode, "--mode-reference", "user answered for this request",
+                  "--run-dir", str(self.run_dir))
+
+    def test_init_requires_current_request_choice_reference(self) -> None:
+        self.call("init", "--repo", str(self.repo), "--scope", "frontend",
+                  "--review-mode", "immediate", "--run-dir", str(self.run_dir), expected=2)
+        self.call("init", "--repo", str(self.repo), "--scope", "frontend",
+                  "--review-mode", "immediate", "--mode-reference", " ",
+                  "--run-dir", str(self.run_dir), expected=1)
+        self.init("frontend")
+        self.assertIn('"mode_reference": "user answered for this request"',
+                      (self.run_dir / "state.json").read_text(encoding="utf-8"))
 
     def write(self, name: str, content: str = "evidence\n") -> None:
         (self.run_dir / name).write_text(content, encoding="utf-8")
@@ -117,13 +128,13 @@ class WorkflowHarnessTest(unittest.TestCase):
         nested_repo = self.base / ".codex" / "implementation-workflow-runs" / "nested-repo"
         (nested_repo / ".git").mkdir(parents=True)
         result = self.call("init", "--repo", str(nested_repo), "--scope", "frontend",
-                           "--review-mode", "immediate",
+                           "--review-mode", "immediate", "--mode-reference", "user answered",
                            "--run-dir", str(nested_repo / "reports"), expected=1)
         self.assertIn("outside the target Git repository", result.stderr)
 
     def test_run_directory_must_use_local_base(self) -> None:
         result = self.call("init", "--repo", str(self.repo), "--scope", "backend",
-                           "--review-mode", "immediate",
+                           "--review-mode", "immediate", "--mode-reference", "user answered",
                            "--run-dir", str(self.base / "Dropbox" / "run"), expected=1)
         self.assertIn("under ~/.codex/implementation-workflow-runs", result.stderr)
 

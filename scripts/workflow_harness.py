@@ -142,6 +142,8 @@ def main() -> int:
     initialize.add_argument("--repo", type=Path, required=True)
     initialize.add_argument("--scope", choices=("frontend", "backend", "both"), required=True)
     initialize.add_argument("--review-mode", choices=("immediate", "user-review"), required=True)
+    initialize.add_argument("--mode-reference", required=True,
+                            help="Reference to the user's answer for this implementation request")
     initialize.add_argument("--run-dir", type=Path)
     for command in ("present", "review", "approve", "accept-design", "check-record", "check"):
         sub = commands.add_parser(command)
@@ -163,6 +165,8 @@ def main() -> int:
 
     try:
         if args.command == "init":
+            if not args.mode_reference.strip():
+                raise ValueError("--mode-reference must identify the user's answer for this request")
             repo_root = args.repo.resolve()
             if not (repo_root / ".git").exists():
                 raise ValueError("--repo must be a Git checkout")
@@ -171,7 +175,8 @@ def main() -> int:
             run_dir.mkdir(parents=True, exist_ok=False)
             run_dir.chmod(0o700)
             write_state(run_dir, {"version": 2, "repo_root": str(repo_root), "scope": args.scope,
-                                  "review_mode": args.review_mode, "events": []})
+                                  "review_mode": args.review_mode,
+                                  "mode_reference": args.mode_reference, "events": []})
             print(run_dir)
             return 0
 
