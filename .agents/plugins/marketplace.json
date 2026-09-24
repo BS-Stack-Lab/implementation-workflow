@@ -1,0 +1,21 @@
+{
+  "name": "implementation-workflow",
+  "interface": {
+    "displayName": "Implementation Workflow"
+  },
+  "plugins": [
+    {
+      "name": "implementation-workflow",
+      "source": {
+        "source": "url",
+        "url": "https://github.com/BS-Stack-Lab/implementation-workflow.git",
+        "ref": "feat/implementation-workflow-harness-orchestration"
+      },
+      "policy": {
+        "installation": "AVAILABLE",
+        "authentication": "ON_INSTALL"
+      },
+      "category": "Productivity"
+    }
+  ]
+}

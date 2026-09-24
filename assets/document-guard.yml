@@ -1,0 +1,57 @@
+# Copy into each repository as .github/workflows/document-guard.yml.
+# Make the "document-guard" job a required status check on every protected branch.
+name: Document guard
+
+on:
+  pull_request:
+  merge_group:
+
+permissions:
+  contents: read
+
+jobs:
+  document-guard:
+    name: document-guard
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Reject document changes except README.md
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha || github.event.merge_group.base_sha }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha || github.event.merge_group.head_sha }}
+        run: |
+          python3 - <<'PY'
+          import os
+          import pathlib
+          import subprocess
+          import sys
+
+          suffixes = {
+              '.adoc', '.asciidoc', '.doc', '.docx', '.epub', '.markdown',
+              '.md', '.mdx', '.odt', '.pages', '.pdf', '.rst', '.rtf', '.txt',
+          }
+          doc_dirs = {'docs', 'documentation', 'design-docs', 'reports'}
+          changed = subprocess.check_output([
+              'git', 'diff', '--name-only', '-z', '--no-renames',
+              os.environ['BASE_SHA'], os.environ['HEAD_SHA'], '--',
+          ])
+          blocked = []
+          for raw in changed.split(b'\0'):
+              if not raw:
+                  continue
+              name = raw.decode('utf-8', 'surrogateescape')
+              path = pathlib.PurePosixPath(name)
+              if path.name.casefold() == 'readme.md':
+                  continue
+              if path.suffix.casefold() in suffixes or any(
+                  part.casefold() in doc_dirs for part in path.parts[:-1]
+              ):
+                  blocked.append(name)
+          if blocked:
+              print('Document changes are blocked; only README.md is allowed:')
+              for name in sorted(set(blocked)):
+                  print(f'  {name}')
+              sys.exit(1)
+          PY

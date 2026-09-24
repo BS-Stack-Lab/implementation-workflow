@@ -1,0 +1,18 @@
+{
+  "description": "Route implementation requests to the implementation workflow skill.",
+  "hooks": {
+    "UserPromptSubmit": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3 \"$PLUGIN_ROOT/hooks/route_implementation.py\"",
+            "timeout": 3,
+            "statusMessage": "Checking implementation workflow",
+            "additionalContextLimit": 700
+          }
+        ]
+      }
+    ]
+  }
+}
