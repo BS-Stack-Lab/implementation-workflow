@@ -44,6 +44,11 @@ class WorkflowHarnessTest(unittest.TestCase):
         self.call("init", "--repo", str(self.repo), "--scope", scope,
                   "--review-mode", review_mode, "--mode-reference", "user answered for this request",
                   "--run-dir", str(self.run_dir))
+        # These fixtures exercise already-created v3 runs after a v4 upgrade.
+        state_file = self.run_dir / "state.json"
+        state = json.loads(state_file.read_text(encoding="utf-8"))
+        state["version"] = 3
+        state_file.write_text(json.dumps(state), encoding="utf-8")
 
     def write(self, name: str, content: str = "evidence\n") -> None:
         (self.run_dir / name).write_text(content, encoding="utf-8")
@@ -271,6 +276,10 @@ class WorkflowHarnessTest(unittest.TestCase):
         self.call("init", "--repo", str(empty_repo), "--scope", "frontend",
                   "--review-mode", "immediate", "--mode-reference", "user answered",
                   "--run-dir", str(self.run_dir))
+        state_file = self.run_dir / "state.json"
+        state = json.loads(state_file.read_text(encoding="utf-8"))
+        state["version"] = 3
+        state_file.write_text(json.dumps(state), encoding="utf-8")
         self.write("frontend-design.md")
         self.check_record("frontend")
 
@@ -326,7 +335,7 @@ class WorkflowHarnessTest(unittest.TestCase):
                                 "--review-mode", "immediate", "--mode-reference", "answer",
                                 "--work-item", "profile page").stdout.strip())
         self.assertEqual(first.parent, second.parent)
-        self.assertNotEqual(first, second)
+        self.assertEqual(first, second)
         self.assertEqual(first.parents[3], self.docs)
         self.assertTrue(first.name.startswith("run-"))
         self.assertTrue((first / "state.json").exists())

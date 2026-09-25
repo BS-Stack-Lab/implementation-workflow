@@ -12,7 +12,8 @@ ACTION_TERMS = (
     "코드 작성", "코드를 작성", "코드 수정", "코드를 수정", "기능 추가",
     "기능을 추가", "버그 수정", "오류 수정", "고쳐줘", "고쳐 줘",
     "implement", "build the feature", "write code", "change the code",
-    "fix the bug", "add the feature",
+    "fix the bug", "add the feature", "이어서 진행", "계속 진행",
+    "작업 진행", "진행해줘", "continue implementation",
 )
 DISCUSSION_TERMS = (
     "방법", "설명", "알려줘", "가능한지", "가능해", "비교", "추천",
@@ -50,19 +51,14 @@ def main() -> None:
         "hookSpecificOutput": {
             "hookEventName": "UserPromptSubmit",
             "additionalContext": (
-                "For this code implementation request, load the "
-                "implementation-workflow skill before changing code. "
-                "At the start of EVERY new implementation request, ask the user "
-                "to choose one of two design review modes: (1) implement after "
-                "independent design review, or (2) let the user review the design "
-                "before implementation. Wait for an explicit answer. Never reuse "
-                "a choice from an earlier request or infer it from context. "
-                "Use a supported question UI with choices and free text when available. "
-                "Use three distinct subagents for each design review, code review, "
-                "and QA stage. Follow the design-review approval gate. "
-                "Keep generated design, review, and QA documents under "
-                "~/Documents/docs in the matching branch or work folder, outside Git. "
-                "Reuse an existing matching folder when one is identified."
+                "Load the implementation-workflow skill. For EVERY new implementation request, "
+                "ask the two design review modes using a choice/free-text UI. Wait for an explicit answer. "
+                "First identify the work item and existing local run; use harness status to resume "
+                "its next_action without repeating the mode question. A design-only request ends "
+                "at design delivery. For an immediate-mode implementation run, pass the design gate "
+                "and continue through code, tests, review, QA, and final report in this task. "
+                "User-review waits for explicit design acceptance. Keep generated documents in "
+                "~/Documents/docs outside Git."
             ),
         }
     }, ensure_ascii=False))
