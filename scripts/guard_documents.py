@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Reject documentation changes, except README.md, before Git writes."""
+"""Reject documentation changes, except the repository-root README.md."""
 
 from __future__ import annotations
 
@@ -19,7 +19,7 @@ DOCUMENT_DIRS = {"docs", "documentation", "design-docs", "reports"}
 
 def is_blocked_document(raw_path: str) -> bool:
     path = PurePosixPath(raw_path)
-    if path.name.casefold() == "readme.md":
+    if path.as_posix().casefold() == "readme.md":
         return False
     if path.suffix.casefold() in DOCUMENT_SUFFIXES:
         return True

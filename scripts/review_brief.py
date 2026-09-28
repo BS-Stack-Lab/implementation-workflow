@@ -4,9 +4,13 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
+import os
+import re
 import subprocess
 import sys
+import uuid
 from pathlib import Path
 
 from orchestrate import choose_model, focus_for, focus_question
@@ -61,6 +65,130 @@ def open_findings(run_dir: Path, state: dict, area: str) -> list[dict[str, str]]
     return findings
 
 
+def optional_review_context(run_dir: Path) -> dict:
+    context = {}
+    source_path = run_dir / "official-sources.json"
+    if source_path.is_file() and not source_path.is_symlink():
+        source_data = json.loads(source_path.read_text(encoding="utf-8"))
+        context["official_sources"] = source_data
+        context["official_sources_digest"] = hashlib.sha256(source_path.read_bytes()).hexdigest()
+    scope_path = run_dir / "scope-register.json"
+    if scope_path.is_file() and not scope_path.is_symlink():
+        scope_data = json.loads(scope_path.read_text(encoding="utf-8"))
+        questions = scope_data.get("questions", []) if isinstance(scope_data, dict) else []
+        context["scope_questions"] = [
+            {key: item.get(key) for key in
+             ("id", "kind", "status", "question", "paths", "impact", "blocks_requested_work")}
+            for item in questions if isinstance(item, dict)
+        ]
+        context["scope_digest"] = hashlib.sha256(scope_path.read_bytes()).hexdigest()
+    return context
+
+
+def acceptance_criteria(run_dir: Path, area: str) -> list[dict[str, str]]:
+    content = (run_dir / f"{area}-design.md").read_bytes().decode("utf-8")
+    return acceptance_criteria_from_text(content, area)
+
+
+def acceptance_criteria_from_text(content: str, area: str) -> list[dict[str, str]]:
+    section = re.search(r"(?ms)^##\s+(?:수용 기준|Acceptance Criteria)\s*$\n(.*?)(?=^##\s+|\Z)",
+                        content)
+    if not section:
+        raise ValueError(f"design needs a ## 수용 기준 section: {area}")
+    matcher = re.compile(r"^\s*(?:[-*]\s*)?((?:AC-[\w.-]+)|(?:R\d+))\s*[.:)\-]\s*(.*)$")
+    criteria = []
+    for line in section.group(1).splitlines():
+        if not line.strip():
+            continue
+        match = matcher.match(line)
+        if match:
+            criteria.append({"id": match.group(1), "text": match.group(2).strip()})
+    return criteria
+
+
+def design_delta(run_dir: Path, state: dict, area: str, criteria: list[dict[str, str]]) -> dict:
+    design_bytes = (run_dir / f"{area}-design.md").read_bytes()
+    design_text = design_bytes.decode("utf-8")
+    current_digest = hashlib.sha256(design_bytes).hexdigest()
+    history_dir = run_dir / ".review-history"
+    if history_dir.is_symlink():
+        raise ValueError("review history directory must not be a symbolic link")
+    history_dir.mkdir(exist_ok=True)
+    current_path = history_dir / f"{area}-{current_digest}.json"
+    if current_path.is_symlink():
+        raise ValueError("review history snapshot must not be a symbolic link")
+    current_snapshot = None
+    if current_path.exists():
+        current_snapshot = validate_snapshot(current_path, current_digest, area)
+        if current_snapshot is not None:
+            design_text = current_snapshot["design_text"]
+    if not current_path.exists() or current_snapshot is None:
+        temporary = history_dir / f".{uuid.uuid4().hex}.tmp"
+        temporary.write_text(json.dumps({"schema_version": 2, "digest": current_digest,
+                                        "design_text": design_text},
+                                        ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+        os.replace(temporary, current_path)
+
+    prior_events = [event for event in state.get("events", [])
+                    if event.get("type") == "review" and event.get("area") == area
+                    and event.get("digest") != current_digest]
+    baseline = None
+    if prior_events:
+        prior_digest = prior_events[-1].get("digest")
+        if isinstance(prior_digest, str) and re.fullmatch(r"[0-9a-f]{64}", prior_digest):
+            prior_path = history_dir / f"{area}-{prior_digest}.json"
+            if prior_path.is_file() and not prior_path.is_symlink():
+                baseline = validate_snapshot(prior_path, prior_digest, area)
+
+    current = {item["id"]: item["text"] for item in criteria}
+    previous = ({item["id"]: item["text"] for item in baseline["criteria"]}
+                if baseline else current)
+    def preview(value: str) -> dict[str, object]:
+        return {"text": value[:240], "truncated": len(value) > 240,
+                "sha256": hashlib.sha256(value.encode("utf-8")).hexdigest()}
+
+    changes = []
+    for criterion_id in sorted(set(previous) | set(current)):
+        if criterion_id not in previous:
+            changes.append({"id": criterion_id, "change": "added",
+                            "current": preview(current[criterion_id])})
+        elif criterion_id not in current:
+            changes.append({"id": criterion_id, "change": "removed",
+                            "previous": preview(previous[criterion_id])})
+        elif previous[criterion_id] != current[criterion_id]:
+            changes.append({"id": criterion_id, "change": "updated",
+                            "previous": preview(previous[criterion_id]),
+                            "current": preview(current[criterion_id])})
+    previous_findings = [
+        {"id": f"slot-{event.get('slot')}", "summary": str(event.get("finding", ""))[:240]}
+        for event in prior_events if event.get("result") == "changes-required"
+    ]
+    return {"baseline_status": "available" if baseline else "unavailable",
+            "baseline_digest": baseline.get("digest") if baseline else None,
+            "current_digest": current_digest,
+            "changed_criteria": changes,
+            "current_criteria": [{"id": item["id"], "text": item["text"][:240],
+                                  "truncated": len(item["text"]) > 240,
+                                  "sha256": hashlib.sha256(item["text"].encode("utf-8")).hexdigest()}
+                                 for item in criteria],
+            "previous_review_findings": previous_findings}
+
+
+def validate_snapshot(path: Path, expected_digest: str, area: str) -> dict | None:
+    candidate = json.loads(path.read_text(encoding="utf-8"))
+    design_text = candidate.get("design_text") if isinstance(candidate, dict) else None
+    if isinstance(candidate, dict) and candidate.get("digest") == expected_digest \
+            and "design_text" not in candidate and isinstance(candidate.get("criteria"), list):
+        return None
+    if (not isinstance(design_text, str) or candidate.get("schema_version") != 2
+            or candidate.get("digest") != expected_digest
+            or hashlib.sha256(design_text.encode("utf-8")).hexdigest() != expected_digest):
+        raise ValueError("review history snapshot changed after recording")
+    return {"digest": expected_digest,
+            "design_text": design_text,
+            "criteria": acceptance_criteria_from_text(design_text, area)}
+
+
 def brief(run_dir: Path, stage: str, area: str, slot: int, source: str,
           source_version: str, approval_reference: str, supported: dict[str, list[str]],
           default_model: str, default_effort: str, base: str | None = None) -> dict:
@@ -75,6 +203,9 @@ def brief(run_dir: Path, stage: str, area: str, slot: int, source: str,
         raise ValueError("source, source version, and approval reference are required")
     area_names = ["frontend", "backend"] if area == "integration" else [area]
     criteria = {name: sorted(acceptance_ids(run_dir, name)) for name in area_names}
+    criteria_details = {name: acceptance_criteria(run_dir, name) for name in area_names}
+    deltas = {name: design_delta(run_dir, state, name, criteria_details[name])
+              for name in area_names}
     path_areas = (["frontend", "backend", "integration"] if area == "integration"
                   else [area])
     changed = []
@@ -91,8 +222,10 @@ def brief(run_dir: Path, stage: str, area: str, slot: int, source: str,
         "design_files": [str(run_dir / f"{name}-design.md") for name in area_names],
         "plan_files": [str(run_dir / "verification-plan.json"), str(run_dir / "qa-plan.json")],
         "acceptance_ids": criteria,
+        "design_delta": deltas,
         "changed_paths": changed,
         "open_findings": open_findings(run_dir, state, area),
+        **optional_review_context(run_dir),
         "evidence_dir": str(run_dir),
         "policies": ["read-only review", f"{len(required_slots(state))} distinct agent ID(s)",
                      "expand context when dependencies or ownership are uncertain",

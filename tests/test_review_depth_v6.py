@@ -49,6 +49,13 @@ class ReviewDepthV6Test(unittest.TestCase):
         self.call("init", "--repo", str(self.repo), "--scope", "backend",
                   "--review-mode", "immediate", "--mode-reference", "this request",
                   "--review-depth", depth, "--risk-reason", "localized app logic")
+        state_file = self.run_dir / "state.json"
+        state = json.loads(state_file.read_text(encoding="utf-8"))
+        state["version"] = 7
+        state_file.write_text(json.dumps(state), encoding="utf-8")
+        (self.run_dir / "official-sources.json").write_text(json.dumps({
+            "schema_version": 1, "status": "not_applicable", "sources": [],
+            "reason": "isolated harness fixture for review-depth compatibility"}))
 
     def result(self, stage: str, outcome: str) -> Path:
         data = {"schema_version": 1, "stage": stage, "area": "backend", "slot": 1,

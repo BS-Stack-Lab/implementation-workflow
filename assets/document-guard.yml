@@ -43,7 +43,7 @@ jobs:
                   continue
               name = raw.decode('utf-8', 'surrogateescape')
               path = pathlib.PurePosixPath(name)
-              if path.name.casefold() == 'readme.md':
+              if path.as_posix().casefold() == 'readme.md':
                   continue
               if path.suffix.casefold() in suffixes or any(
                   part.casefold() in doc_dirs for part in path.parts[:-1]

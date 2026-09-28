@@ -9,7 +9,7 @@
             "command": "python3 \"$PLUGIN_ROOT/hooks/route_implementation.py\"",
             "timeout": 3,
             "statusMessage": "Checking implementation workflow",
-            "additionalContextLimit": 700
+            "additionalContextLimit": 1200
           }
         ]
       }

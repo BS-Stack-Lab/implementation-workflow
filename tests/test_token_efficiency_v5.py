@@ -239,6 +239,142 @@ class TokenEfficiencyV5Test(unittest.TestCase):
         for name in ("intake-design.md", "implementation-check.md", "review-qa.md"):
             self.assertIn(name, skill)
 
+    def test_brief_includes_changed_criteria_and_previous_finding_summary(self) -> None:
+        self.state["scope"] = "backend"
+        self.state["review_mode"] = "immediate"
+        (self.run_dir / "state.json").write_text(json.dumps(self.state))
+        (self.run_dir / "backend-design.md").write_text(
+            "## 수용 기준\nR1. Verify current account\n")
+        initial = brief(self.run_dir, "design-review", "backend", 1,
+                        "conversation:request-42", "v1", "none",
+                        {"gpt-6-luna": ["medium"]}, "gpt-6-luna", "medium")
+        baseline = initial["design_delta"]["backend"]["current_digest"]
+        self.assertEqual(initial["design_delta"]["backend"]["changed_criteria"], [])
+        self.state["events"] = [{"type": "review", "area": "backend", "slot": 2,
+                                  "result": "changes-required", "finding": "Add token expiry criteria",
+                                  "digest": baseline}]
+        (self.run_dir / "state.json").write_text(json.dumps(self.state))
+        (self.run_dir / "backend-design.md").write_text(
+            "## 수용 기준\nR1. Verify current account and reject expired token\n"
+            "R2. Keep the request idempotent\n")
+        revised = brief(self.run_dir, "design-review", "backend", 1,
+                        "conversation:request-42", "v1", "approval-1",
+                        {"gpt-6-luna": ["medium"]}, "gpt-6-luna", "medium")
+        delta = revised["design_delta"]["backend"]
+        self.assertEqual(delta["baseline_digest"], baseline)
+        self.assertEqual([(item["id"], item["change"]) for item in delta["changed_criteria"]],
+                         [("R1", "updated"), ("R2", "added")])
+        self.assertEqual(delta["previous_review_findings"][0]["summary"],
+                         "Add token expiry criteria")
+        self.state["events"].append({"type": "review", "area": "backend", "slot": 2,
+                                      "result": "clear",
+                                      "digest": delta["current_digest"]})
+        (self.run_dir / "state.json").write_text(json.dumps(self.state))
+        (self.run_dir / "backend-design.md").write_text(
+            "## 수용 기준\nR1. Verify current account and reject expired token\n"
+            "R2. Keep the request idempotent under retries\n")
+        updated_again = brief(self.run_dir, "design-review", "backend", 1,
+                              "conversation:request-42", "v1", "approval-2",
+                              {"gpt-6-luna": ["medium"]}, "gpt-6-luna", "medium")
+        second_delta = updated_again["design_delta"]["backend"]
+        self.assertEqual(second_delta["baseline_digest"], delta["current_digest"])
+        self.assertEqual([(item["id"], item["change"]) for item in second_delta["changed_criteria"]],
+                         [("R2", "updated")])
+
+    def test_brief_rejects_tampered_design_snapshot(self) -> None:
+        self.state["scope"] = "backend"
+        self.state["review_mode"] = "immediate"
+        (self.run_dir / "state.json").write_text(json.dumps(self.state))
+        design = self.run_dir / "backend-design.md"
+        design.write_text("## 수용 기준\nR1. Verify account\n")
+        initial = brief(self.run_dir, "design-review", "backend", 1,
+                        "conversation:request-42", "v1", "none",
+                        {"gpt-6-luna": ["medium"]}, "gpt-6-luna", "medium")
+        digest = initial["design_delta"]["backend"]["current_digest"]
+        self.state["events"] = [{"type": "review", "area": "backend", "slot": 1,
+                                  "result": "clear", "digest": digest}]
+        (self.run_dir / "state.json").write_text(json.dumps(self.state))
+        snapshot = self.run_dir / ".review-history" / f"backend-{digest}.json"
+        record = json.loads(snapshot.read_text())
+        record["design_text"] = "## 수용 기준\nR1. Tampered account criteria\n"
+        snapshot.write_text(json.dumps(record))
+        design.write_text("## 수용 기준\nR1. Verify account and reject expired sessions\n")
+        with self.assertRaisesRegex(ValueError, "snapshot changed"):
+            brief(self.run_dir, "design-review", "backend", 1,
+                  "conversation:request-42", "v1", "approval-1",
+                  {"gpt-6-luna": ["medium"]}, "gpt-6-luna", "medium")
+
+    def test_brief_reuses_valid_current_snapshot(self) -> None:
+        self.state["scope"] = "backend"
+        self.state["review_mode"] = "immediate"
+        (self.run_dir / "state.json").write_text(json.dumps(self.state))
+        (self.run_dir / "backend-design.md").write_text("## 수용 기준\nR1. Verify account\n")
+        first = brief(self.run_dir, "design-review", "backend", 1,
+                      "conversation:request-42", "v1", "none",
+                      {"gpt-6-luna": ["medium"]}, "gpt-6-luna", "medium")
+        second = brief(self.run_dir, "design-review", "backend", 1,
+                       "conversation:request-42", "v1", "none",
+                       {"gpt-6-luna": ["medium"]}, "gpt-6-luna", "medium")
+        self.assertEqual(first["design_delta"], second["design_delta"])
+
+    def test_brief_detects_criteria_changes_after_preview_limit(self) -> None:
+        self.state["scope"] = "backend"
+        self.state["review_mode"] = "immediate"
+        (self.run_dir / "state.json").write_text(json.dumps(self.state))
+        design = self.run_dir / "backend-design.md"
+        first_criterion = "A" * 300
+        design.write_text(f"## 수용 기준\nR1. {first_criterion}\n")
+        initial = brief(self.run_dir, "design-review", "backend", 1,
+                        "conversation:request-42", "v1", "none",
+                        {"gpt-6-luna": ["medium"]}, "gpt-6-luna", "medium")
+        digest = initial["design_delta"]["backend"]["current_digest"]
+        self.state["events"] = [{"type": "review", "area": "backend", "slot": 1,
+                                  "result": "clear", "digest": digest}]
+        (self.run_dir / "state.json").write_text(json.dumps(self.state))
+        design.write_text(f"## 수용 기준\nR1. {'A' * 240}B{'A' * 59}\n")
+        revised = brief(self.run_dir, "design-review", "backend", 1,
+                        "conversation:request-42", "v1", "approval-1",
+                        {"gpt-6-luna": ["medium"]}, "gpt-6-luna", "medium")
+        change = revised["design_delta"]["backend"]["changed_criteria"][0]
+        self.assertEqual((change["id"], change["change"]), ("R1", "updated"))
+        self.assertTrue(change["previous"]["truncated"])
+        self.assertTrue(change["current"]["truncated"])
+        self.assertNotEqual(change["previous"]["sha256"], change["current"]["sha256"])
+
+    def test_brief_migrates_current_legacy_snapshot_and_ignores_untrusted_prior(self) -> None:
+        self.state["scope"] = "backend"
+        self.state["review_mode"] = "immediate"
+        (self.run_dir / "state.json").write_text(json.dumps(self.state))
+        design = self.run_dir / "backend-design.md"
+        design.write_text("## 수용 기준\nR1. Verify account\n")
+        first = brief(self.run_dir, "design-review", "backend", 1,
+                      "conversation:request-42", "v1", "none",
+                      {"gpt-6-luna": ["medium"]}, "gpt-6-luna", "medium")
+        digest = first["design_delta"]["backend"]["current_digest"]
+        history = self.run_dir / ".review-history"
+        snapshot = history / f"backend-{digest}.json"
+        snapshot.write_text(json.dumps({"digest": digest,
+                                        "criteria": [{"id": "R1", "text": "Verify account"}]}))
+        migrated = brief(self.run_dir, "design-review", "backend", 1,
+                         "conversation:request-42", "v1", "none",
+                         {"gpt-6-luna": ["medium"]}, "gpt-6-luna", "medium")
+        self.assertEqual(json.loads(snapshot.read_text())["schema_version"], 2)
+        self.assertEqual(migrated["design_delta"]["backend"]["changed_criteria"], [])
+
+        self.state["events"] = [{"type": "review", "area": "backend", "slot": 1,
+                                  "result": "clear", "digest": digest}]
+        (self.run_dir / "state.json").write_text(json.dumps(self.state))
+        snapshot.write_text(json.dumps({"digest": digest,
+                                        "criteria": [{"id": "R1", "text": "tampered"}]}))
+        design.write_text("## 수용 기준\nR1. Verify account and reject expired token\n")
+        revised = brief(self.run_dir, "design-review", "backend", 1,
+                        "conversation:request-42", "v1", "approval-1",
+                        {"gpt-6-luna": ["medium"]}, "gpt-6-luna", "medium")
+        delta = revised["design_delta"]["backend"]
+        self.assertEqual(delta["baseline_status"], "unavailable")
+        self.assertEqual(delta["changed_criteria"], [])
+        self.assertEqual(delta["current_criteria"][0]["id"], "R1")
+
     def test_aggregate_preserves_slot_disagreement_and_archives_previous(self) -> None:
         items = []
         for slot in (1, 2, 3):
@@ -291,7 +427,7 @@ class TokenEfficiencyV5Test(unittest.TestCase):
              "--review-mode", "immediate", "--mode-reference", "user chose immediate",
              "--run-dir", str(run))
         state = json.loads((run / "state.json").read_text())
-        self.assertEqual(state["version"], 7)
+        self.assertEqual(state["version"], 8)
         state["version"] = 5
         (run / "state.json").write_text(json.dumps(state))
         (run / "backend-design.md").write_text("## 수용 기준\nR1. expected\n")

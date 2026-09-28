@@ -62,6 +62,13 @@ class DocumentGuardTest(unittest.TestCase):
         self.git("add", "README.md")
         self.assertEqual(self.guard("--staged").returncode, 0)
 
+    def test_nested_readme_is_blocked(self) -> None:
+        self.write("docs/README.md", "local documentation\n")
+        self.git("add", "docs/README.md")
+        result = self.guard("--staged")
+        self.assertEqual(result.returncode, 1)
+        self.assertIn("docs/README.md", result.stderr)
+
     def test_committed_document_is_blocked_in_diff(self) -> None:
         self.write("SKILL.md", "instructions\n")
         self.git("add", "SKILL.md")

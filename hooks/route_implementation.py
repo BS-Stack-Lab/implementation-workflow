@@ -52,13 +52,18 @@ def main() -> None:
             "hookEventName": "UserPromptSubmit",
             "additionalContext": (
                 "Load the implementation-workflow skill. For EVERY new implementation request, "
-                "ask the two design review modes using a choice/free-text UI. Wait for an explicit answer. "
+                "ask the two design review modes using a choice/free-text UI when the host provides one; "
+                "otherwise ask in conversation. Wait for an explicit answer. "
                 "First identify the work item and existing local run; use harness status to resume "
                 "its next_action without repeating the mode question. A design-only request ends "
                 "at design delivery. For an immediate-mode implementation run, pass the design gate "
                 "and continue through code, tests, review, QA, and final report in this task. "
                 "User-review waits for explicit design acceptance. Keep generated documents in "
-                "~/Documents/docs outside Git."
+                "~/Documents/docs outside Git. Use official, version-matched vendor documentation "
+                "and record sources before implementation. Ask about out-of-scope findings without "
+                "blocking independent requested work; record declined or unanswered items in the "
+                "final local Markdown report. Do not claim unfinished reviews passed. Add code "
+                "comments only for product or domain policy."
             ),
         }
     }, ensure_ascii=False))

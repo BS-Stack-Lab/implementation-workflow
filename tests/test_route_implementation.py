@@ -24,6 +24,9 @@ class RouteImplementationTest(unittest.TestCase):
         context = output["hookSpecificOutput"]["additionalContext"]
         self.assertIn("EVERY new implementation request", context)
         self.assertIn("Wait for an explicit answer", context)
+        self.assertIn("official, version-matched vendor documentation", context)
+        self.assertIn("out-of-scope findings", context)
+        self.assertIn("final local Markdown report", context)
 
     def test_explanation_request_does_not_route(self) -> None:
         self.assertEqual(self.invoke("구현 방법을 설명해줘"), "")

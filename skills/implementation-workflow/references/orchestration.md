@@ -6,6 +6,8 @@
 
 신규 실행에서는 `--work-item <작업-ID>`를 지정해 동일 작업의 미완료 실행을 재사용한다. 명시적으로 새 실행을 만들 때는 `--new-run`을 사용한다. 두 영역이 다른 Git 체크아웃에 있으면 `init --scope both --frontend-repo <FE-저장소> --backend-repo <BE-저장소>`를 사용한다. 연동 명령의 작업 디렉터리를 별도로 지정하려면 `--integration-repo <저장소>`를 추가한다. 같은 체크아웃에서 양쪽을 작업하면 두 인수에 같은 루트를 지정한다. 기존 실행 기록은 해당 버전의 방식으로 읽는다.
 
+불완전한 v2~v7 실행을 정확히 선택해 재개하면 원본 상태를 `legacy-state-vN.json`으로 보존하고 v8 현재 게이트로 승격한다. 이전 run ID와 파일은 유지하지만 공식 출처·범위 질문·현재 계획 digest에 결합되지 않은 이전 PASS를 새 게이트의 증거로 간주하지 않는다. 필요한 단계의 증거를 현재 코드 상태에서 다시 만든다. 완료된 구형 실행은 과거 기록으로 유지한다. 둘 이상의 실행이 일치하면 자동 선택하지 않고 정확한 `--resume-run <run-dir>` 선택을 요구한다. 구형 state에 시작 기준 커밋이 없거나 찾을 수 없으면 `init --resume-run <run-dir> --legacy-base backend=<확인한-커밋>`을 요구한다. `both` 범위는 저장소별로 이 인자를 반복한다. 기준은 현재 checkout의 조상 커밋이어야 한다.
+
 ## 범위별 작업 그래프
 
 플러그인 루트는 이 `SKILL.md` 파일의 두 단계 위 디렉터리다. 범위를 판별한 다음 다음 명령으로 작업 그래프를 읽는다.
@@ -30,9 +32,11 @@ python3 <plugin-root>/scripts/orchestrate.py --scope both --review-mode <immedia
 
 서브에이전트에게는 역할·작업 범위·읽을 문서·오케스트레이터가 출력한 슬롯별 `focus`와 질문·기대 산출물·편집 권한을 명시한다. `focus` 값은 결과 기록에도 그대로 사용한다. 검토 역할은 파일을 수정하지 않는다. 각 단계의 실제 canonical agent ID를 기록하고 동일 단계·영역의 세 ID가 다른지 확인한다. 세 명을 확보하지 못하면 완료로 표시하지 않고 이유를 사용자에게 보고한다. 서브에이전트의 판단을 사용자 승인으로 취급하지 않는다. 코디네이터는 세 결론·증거·상충 의견·미해결 항목과 원본 로컬 링크를 통합 리포트에 남긴다. 하네스는 agent ID 문자열의 실제 신원을 독립적으로 증명할 수 없다.
 
-## 신규 실행 계획
+## 신규 v8 실행 계획
 
-신규 v7 실행에서는 설계 검토 결과를 기록하기 전에 실행 폴더에 `verification-plan.json`과 `qa-plan.json`을 작성한다. 저장소에서 확인한 실제 명령만 계획에 넣는다. 전자는 영역마다 고유 검사 ID, 종류(`test`·`lint`·`build`·`other`), 명령, 필수 여부를 담는다. 각 작업 영역에는 필수 `test`가 적어도 하나 필요하며 선택 검사에는 이유를 쓴다. 예를 들어 백엔드만 작업한다면 다음 형태다.
+신규 v8 실행에서는 설계 검토 결과를 기록하기 전에 저장소의 의존성·실행 환경 버전에 맞춘 공식 문서/API 레퍼런스를 확인하고 `official-sources.json`을 작성한다. 각 출처는 ID, publisher, title, HTTPS URL, 문서 `version`, `checked_on`, 저장소에서 확인한 `detected_version`, `version_source`, `claims`, `applied_to`를 갖는다. 실행기는 형식을 검증하며, 코디네이터와 검토자가 detected version과 공식 문서 버전이 실제로 맞는지 대조한다. 적용 가능한 공식 문서는 적어도 하나여야 한다. 적용 자료가 없을 때만 `status: not_applicable`, 빈 `sources`, 구체적 `reason`을 기록한다. 기본 `pending` 상태는 설계 게이트를 막는다. 출처 매니페스트는 검사·설계·리뷰·QA·최종 보고 binding에 포함된다.
+
+그다음 실행 폴더에 `verification-plan.json`과 `qa-plan.json`을 작성한다. 저장소에서 확인한 실제 명령만 계획에 넣는다. 전자는 영역마다 고유 검사 ID, 종류(`test`·`lint`·`build`·`other`), 명령, 필수 여부를 담는다. 각 작업 영역에는 필수 `test`가 적어도 하나 필요하며 선택 검사에는 이유를 쓴다. 예를 들어 백엔드만 작업한다면 다음 형태다.
 
 ```json
 {"backend":[{"id":"unit-tests","kind":"test","command":"python3 -m unittest discover -s tests","required":true}]}
@@ -45,6 +49,8 @@ python3 <plugin-root>/scripts/orchestrate.py --scope both --review-mode <immedia
 ```
 
 계획과 설계 문서는 실행 폴더 안에 둔다. `design` 게이트는 계획의 범위·중복·수용 기준 커버리지를 검사하고 설계 및 계획 파일의 해시를 기록한다. 설계나 계획이 바뀌면 이전 게이트는 무효다. 원문 요구사항 자체가 설계에서 빠졌는지는 하네스가 알 수 없으므로 설계 검토자와 코디네이터가 대조한다.
+
+범위 밖에서 발견한 개선은 `scope-question`으로 등록한다. `scope_extension`은 `blocks_requested_work: false`로 항상 비차단이며 승인된 경우에만 범위에 추가한다. 거절·미응답이면 본 작업은 계속하고 질문과 영향을 최종 로컬 보고서에 남긴다. 원래 요청의 필수 동작에 답이 필요한 경우에만 `required_decision`을 사용한다. 이 결정에 종속되지 않은 설계·구현·검증을 계속하고, 미해결 결정이 남으면 최종 보고서는 `incomplete`로 게시한다. 미응답 또는 거절된 필수 결정은 그 incomplete 보고서의 현재 revision/digest를 사용해 같은 run에서 다시 답할 수 있다. 새 응답을 기록하면 이전 리포트와 설계·검증 증거는 현재 결과를 승인하지 않으며 필요한 게이트부터 다시 수행한다. `report-publish`는 보고 시점에 남은 질문을 미응답으로 닫고 변경 경로·파일 위치·동작 원리·공식 출처·검증·질문 상태를 포함한 초안만 원자적으로 게시한다.
 
 ## 로컬 하네스 게이트
 
@@ -65,6 +71,9 @@ python3 <plugin-root>/scripts/workflow_harness.py resolve-qa-case --run-dir <loc
 python3 <plugin-root>/scripts/workflow_harness.py agent-result --run-dir <local-run-dir> --stage qa --area <area> --slot <1|2|3> --agent-id <actual-subagent-id> --focus <orchestrator-focus> --result pass
 python3 <plugin-root>/scripts/workflow_harness.py resolve-agent --run-dir <local-run-dir> --stage code-review --area <frontend|backend> --slot <1|2|3> --reference <resolution-evidence>
 python3 <plugin-root>/scripts/workflow_harness.py check --run-dir <local-run-dir> --gate final
+python3 <plugin-root>/scripts/workflow_harness.py scope-question --run-dir <local-run-dir> --question-id <stable-id> --kind <scope_extension|required_decision> --question <question> --path <affected-path> --impact <impact>
+python3 <plugin-root>/scripts/workflow_harness.py scope-answer --run-dir <local-run-dir> --question-id <stable-id> --run-id <current-run-id> --revision <revision> --question-digest <digest> --status <approved|declined> --answer <answer> --reference <user-response>
+python3 <plugin-root>/scripts/workflow_harness.py report-publish --run-dir <local-run-dir> --draft-file <local-report-draft.md>
 ```
 
 `init`의 `--mode-reference`에는 이번 구현 요청에 대해 사용자가 두 방식 중 하나를 선택한 실제 응답을 기록한다. 하네스는 빈 참조를 거부하지만 그 응답의 진위를 독립적으로 확인하지는 못한다. `init`이 출력한 작업 폴더에 설계·검토·QA 리포트를 작성한다. `user-review`를 선택했다면 설계 초안 작성 직후 해당 문서의 클릭 가능한 절대 경로를 사용자에게 전달하고 `present`를 기록한다. 문서를 변경하면 다시 전달하고 `present`를 갱신한다. 설계 검토 원본은 `{area}-design-review-1.md`부터 `-3.md`까지 작성하고, 두 영역 작업의 계약 원본은 `integration-contract-review-1.md`부터 `-3.md`까지 작성한다. 세 결과를 모두 수집한 후 한 명이라도 `changes-required`이면 발견 사항 전체를 보고하고 실제 사용자 승인 뒤에만 `approve`를 호출한다. 설계 변경 후 세 명 모두 다시 검토한다. 영역별 통합 설계 검토 문서도 작성한다. `user-review`에서는 최종 설계와 검토 결과를 보여준 뒤 사용자 확인을 받았을 때만 `accept-design`을 기록한다.
@@ -73,4 +82,6 @@ python3 <plugin-root>/scripts/workflow_harness.py check --run-dir <local-run-dir
 
 `final` 게이트는 현재 설계·계획·Git 코드 상태와 세 코드 검토, 세 QA, 각 계획 시나리오의 최신 결과, 모든 적용 수용 기준의 커버리지, 최종 리포트를 확인한다. 모든 과거 자동 검증·QA 시도의 증거 파일은 실행 폴더 아래 비어 있지 않은 일반 파일이어야 하고, 시도마다 고유하며 원래 해시와 일치해야 한다. 심볼릭 링크와 실행 폴더 밖 경로는 사용할 수 없다. 두 영역이면 연동 QA 원본 세 건과 통합 문서도 필요하다. 같은 코드 상태에서 코드 검토 `findings`를 해결해 다시 통과시키려면 `resolve-agent`에 해결 근거를 기록한 다음 결과를 다시 기록한다. 검사나 QA 시나리오 실패·미실행 뒤에는 각각 `resolve-check` 또는 `resolve-qa-case`로 원인·조치를 기록하고 같은 ID를 새 증거로 재실행한다. 환경 복구나 설명만으로 PASS로 바꾸지 않는다. 코드나 설계가 바뀌면 관련 검사·세 검토·QA를 새 상태에서 다시 수행한다. 필수 미실행 및 QA `not-run`은 완료가 아니다. 기록된 agent ID, 사용자 응답, 증거 내용의 진실성은 하네스가 독립적으로 증명할 수 없으므로 코디네이터가 실제 결과를 확인한다.
 
-사용자 질문에는 해당 질문 유형에 허용된 Codex 질문 UI를 우선 사용해 선택지와 자유 입력을 제공한다. UI가 없으면 일반 대화로 질문한다. 정확한 버튼 이름은 Codex 클라이언트가 제어한다. 기존 v2·v3 작업 폴더는 이전 CLI와 게이트로 계속 확인하며, 위 manifest 기반 증거 명령은 신규 v7 실행에 적용한다. v2~v6 실행은 당시 상태 버전의 검증 규칙으로 읽는다.
+사용자 질문에는 해당 질문 유형에 허용된 Codex 질문 UI를 우선 사용해 선택지와 자유 입력을 제공한다. UI가 없으면 일반 대화로 질문한다. 정확한 버튼 이름은 Codex 클라이언트가 제어한다. 검토 지연 시간은 운영상의 soft target으로 관리한다. 제한 시간을 넘어도 판단이 오지 않으면 지연 슬롯과 blocker를 기록하고 독립 작업을 계속하되 해당 검토를 통과 처리하지 않는다. 기존 v2~v7 완료 실행은 과거 기록으로 유지하며, 미완료 실행은 정확히 재개할 때 현재 v8 게이트로 승격하고 이전 미결합 PASS를 다시 검증한다.
+
+최종 보고서는 실행 폴더에 작성하고 `report-publish`로 현재 코드·설계·계획·질문·출처에 묶어 게시한다. 변경 파일과 코드 위치, 동작 원리, 검증 결과, 요청 밖 문제와 질문 상태를 포함한다. 제품·도메인 정책을 설명하는 경우에만 코드 주석을 추가한다.

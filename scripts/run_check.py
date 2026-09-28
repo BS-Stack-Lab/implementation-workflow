@@ -70,7 +70,7 @@ def capture(run_dir: Path, repo: Path, command: str, timeout: int = 600,
         manifest.update({"run_id": state["run_id"],
                          "checkout_id": checkout_identity(repo),
                          "design_digest": design_digest(run_dir, area),
-                         "plan_digests": plan_digests(run_dir)})
+                         "plan_digests": plan_digests(run_dir, state)})
     target = run_dir / f"check-{attempt_id}.json"
     temporary = run_dir / f".check-{attempt_id}.tmp"
     temporary.write_text(json.dumps(manifest, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")

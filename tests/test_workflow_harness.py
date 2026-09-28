@@ -120,6 +120,9 @@ class WorkflowHarnessTest(unittest.TestCase):
         self.agent_result("code-review", "frontend", 3)
         self.agent_results("qa", "frontend")
         self.call("check", "--run-dir", str(self.run_dir), "--gate", "final")
+        status = json.loads(self.call("status", "--run-dir", str(self.run_dir)).stdout)
+        self.assertTrue(status["complete"])
+        self.assertEqual(status["stage"], "complete")
         self.assertFalse((self.run_dir / "backend-design.md").exists())
 
     def test_user_review_requires_current_design_acceptance(self) -> None:
@@ -298,6 +301,9 @@ class WorkflowHarnessTest(unittest.TestCase):
         self.write("final-report.md")
         self.check_record("frontend")
         self.call("check", "--run-dir", str(self.run_dir), "--gate", "final")
+        status = json.loads(self.call("status", "--run-dir", str(self.run_dir)).stdout)
+        self.assertTrue(status["complete"])
+        self.assertEqual(status["stage"], "complete")
 
     def test_existing_legacy_run_can_continue_but_not_be_initialized(self) -> None:
         self.init("frontend")
@@ -453,14 +459,18 @@ class WorkflowHarnessTest(unittest.TestCase):
         self.assertIn("artifact must be a local file", result.stderr)
 
     def test_scope_aware_plan(self) -> None:
-        frontend = {task["id"] for task in build_plan("frontend")}
-        both = {task["id"] for task in build_plan("both")}
+        frontend_tasks = build_plan("frontend")
+        both_tasks = build_plan("both")
+        frontend = {task["id"] for task in frontend_tasks}
+        both = {task["id"] for task in both_tasks}
         self.assertIn("qa-frontend-3", frontend)
         self.assertNotIn("qa-backend-1", frontend)
         self.assertNotIn("review-contract-1", frontend)
         self.assertIn("qa-backend-3", both)
         self.assertIn("review-contract-3", both)
         self.assertIn("qa-integration-3", both)
+        contract = next(task for task in both_tasks if task["id"] == "review-contract-1")
+        self.assertEqual(contract["depends_on"], ["design-frontend", "design-backend"])
         reviewed = {task["id"] for task in build_plan("both", "user-review")}
         self.assertIn("present-design-frontend", reviewed)
         self.assertIn("present-design-backend", reviewed)

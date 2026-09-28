@@ -80,7 +80,7 @@ class MultiRepoV7Test(unittest.TestCase):
     def test_separate_roots_are_recorded_and_resumed_for_same_work_item(self) -> None:
         run_dir = self.initialize()
         state = read_state(run_dir)
-        self.assertEqual(state["version"], 7)
+        self.assertEqual(state["version"], 8)
         self.assertEqual(Path(state["repo_roots"]["frontend"]), self.frontend)
         self.assertEqual(Path(state["repo_roots"]["backend"]), self.backend)
         self.assertTrue(run_dir.is_relative_to(self.home / "Documents" / "docs"))

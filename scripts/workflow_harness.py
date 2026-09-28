@@ -9,12 +9,15 @@ import hashlib
 import json
 import os
 import re
+import shutil
 import subprocess
 import sys
+import tempfile
 import uuid
 from contextlib import contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
+from urllib.parse import quote
 
 from orchestrate import focus_for
 
@@ -189,7 +192,7 @@ def default_run_dir(repo_root: Path, work_item: str | None = None,
 
 def read_state(run_dir: Path) -> dict:
     state = json.loads((run_dir / "state.json").read_text(encoding="utf-8"))
-    if state.get("version") not in (2, 3, 4, 5, 6, 7):
+    if state.get("version") not in (2, 3, 4, 5, 6, 7, 8):
         raise ValueError("unsupported workflow state version")
     for area in review_areas(state["scope"]):
         repo = repo_for_area(state, area)
@@ -262,7 +265,7 @@ def result_binding(run_dir: Path, raw_path: str, stage: str, area: str, slot: in
 
 def model_selection(model: str | None, effort: str | None,
                     reason: str | None) -> dict[str, str]:
-    if not model or not model.strip() or effort not in {"low", "medium", "high", "xhigh", "max", "ultra"} \
+    if not model or not model.strip() or effort not in {"low", "medium", "high", "xhigh", "max", "ultra", "unavailable"} \
             or not reason or not reason.strip():
         raise ValueError("v5 agent result needs actual model, effort, and selection reason")
     return {"model": model.strip(), "effort": effort, "model_reason": reason.strip()}
@@ -290,7 +293,9 @@ def verify_result_binding(run_dir: Path, event: dict) -> None:
 
 def manifest_binding(run_dir: Path, state: dict, area: str, name: str,
                      raw_path: str, status: str, *, expected_command: str | None = None,
-                     expected_digest: str | None = None) -> dict:
+                     expected_digest: str | None = None,
+                     expected_design_digest: str | None = None,
+                     expected_plan_digests: dict | None = None) -> dict:
     from evidence_summary import read_manifest
 
     manifest, path, digest = read_manifest(run_dir, raw_path)
@@ -309,18 +314,23 @@ def manifest_binding(run_dir: Path, state: dict, area: str, name: str,
     if manifest.get("repo_root") != str(repo_for_area(state, area).resolve()) \
             or manifest.get("area") != area or manifest.get("code_digest") != expected_digest:
         raise ValueError("check manifest came from another repository, area, or code state")
+    required_design_digest = (expected_design_digest if expected_design_digest is not None
+                              else design_digest(run_dir, area))
+    required_plan_digests = (expected_plan_digests if expected_plan_digests is not None
+                              else plan_digests(run_dir, state))
     if state["version"] >= 7 and (manifest.get("schema_version") != 2
             or manifest.get("run_id") != state["run_id"]
             or manifest.get("checkout_id") != state["checkout_ids"][area]
-            or manifest.get("design_digest") != design_digest(run_dir, area)
-            or manifest.get("plan_digests") != plan_digests(run_dir)):
+            or manifest.get("design_digest") != required_design_digest
+            or manifest.get("plan_digests") != required_plan_digests):
         raise ValueError("check manifest differs from the current run, design, or plan")
     return {"manifest_file": path, "manifest_digest": digest,
             "attempt_id": manifest["attempt_id"],
             "evidence_file": manifest["log_file"], "evidence_digest": manifest["log_sha256"]}
 
 
-def verify_manifest_binding(run_dir: Path, state: dict, event: dict) -> None:
+def verify_manifest_binding(run_dir: Path, state: dict, event: dict, *,
+                            historical: bool = False) -> None:
     if any(key not in event for key in ("manifest_file", "manifest_digest", "attempt_id")):
         raise ValueError("v5 check event needs runner manifest")
     if not event.get("planned_command"):
@@ -328,7 +338,11 @@ def verify_manifest_binding(run_dir: Path, state: dict, event: dict) -> None:
     actual = manifest_binding(run_dir, state, event["area"], event["name"],
                               str(run_dir / event["manifest_file"]), event["status"],
                               expected_command=event["planned_command"],
-                              expected_digest=event["digest"])
+                              expected_digest=event["digest"],
+                              expected_design_digest=(event.get("design_digest")
+                                                      if historical else None),
+                              expected_plan_digests=(event.get("plans")
+                                                     if historical else None))
     if any(event.get(key) != value for key, value in actual.items()):
         raise ValueError("check manifest or log changed after recording")
 
@@ -350,9 +364,90 @@ def acceptance_ids(run_dir: Path, area: str) -> set[str]:
     return set(found)
 
 
+def validate_official_sources(run_dir: Path) -> dict:
+    require_artifact(run_dir, "official-sources.json")
+    value = json.loads((run_dir / "official-sources.json").read_text(encoding="utf-8"))
+    if not isinstance(value, dict) or value.get("schema_version") != 1:
+        raise ValueError("official source manifest needs schema_version 1")
+    status = value.get("status")
+    sources = value.get("sources")
+    if (not isinstance(status, str)
+            or status not in {"pending", "applicable", "not_applicable"}
+            or not isinstance(sources, list)):
+        raise ValueError("invalid official source manifest status or sources")
+    if status == "pending":
+        raise ValueError("official source applicability has not been resolved")
+    if status == "not_applicable":
+        if sources or not str(value.get("reason", "")).strip():
+            raise ValueError("not_applicable needs an empty source list and a reason")
+        return value
+    if not sources:
+        raise ValueError("applicable implementation needs at least one official source")
+    source_ids = set()
+    for source in sources:
+        fields = ("id", "publisher", "title", "url", "version", "checked_on",
+                  "detected_version", "version_source")
+        if not isinstance(source, dict) or any(not isinstance(source.get(key), str)
+                                               or not source[key].strip() for key in fields):
+            raise ValueError("official source entry lacks detected version or version evidence")
+        if not source["url"].startswith("https://") or source["id"] in source_ids:
+            raise ValueError("official source URLs must use HTTPS and IDs must be unique")
+        if not isinstance(source.get("claims"), list) or not source["claims"] \
+                or any(not isinstance(item, str) or not item.strip() for item in source["claims"]):
+            raise ValueError("official source claims must be nonempty strings")
+        if not isinstance(source.get("applied_to"), list) or not source["applied_to"] \
+                or any(not isinstance(item, str) or not item.strip() for item in source["applied_to"]):
+            raise ValueError("official source entries need applied files or functions")
+        source_ids.add(source["id"])
+    return value
+
+
+def validate_scope_register(run_dir: Path, state: dict) -> dict:
+    require_artifact(run_dir, "scope-register.json")
+    value = json.loads((run_dir / "scope-register.json").read_text(encoding="utf-8"))
+    if not isinstance(value, dict) or value.get("schema_version") != 1 \
+            or not isinstance(value.get("questions"), list):
+        raise ValueError("scope register needs schema_version 1 and questions")
+    identifiers = set()
+    for question in value["questions"]:
+        required = ("id", "kind", "status", "question", "paths", "impact",
+                    "blocks_requested_work", "run_id", "revision", "question_digest")
+        if not isinstance(question, dict) or any(key not in question for key in required):
+            raise ValueError("scope question is missing required fields")
+        if not isinstance(question["id"], str) or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]{0,63}", question["id"]) \
+                or question["id"] in identifiers:
+            raise ValueError("scope question IDs must be unique stable identifiers")
+        if question["kind"] not in {"scope_extension", "required_decision"} \
+                or question["status"] not in {"pending", "approved", "declined", "unanswered"}:
+            raise ValueError("invalid scope question kind or status")
+        expected_blocking = question["kind"] == "required_decision"
+        if type(question["blocks_requested_work"]) is not bool \
+                or question["blocks_requested_work"] != expected_blocking:
+            raise ValueError("scope_extension is nonblocking; required_decision is blocking")
+        if question["run_id"] != state["run_id"] or type(question["revision"]) is not int \
+                or question["revision"] < 1 or not all(isinstance(question[key], str)
+                                                       and question[key].strip()
+                                                       for key in ("question", "impact", "question_digest")):
+            raise ValueError("scope question is not bound to this run or has invalid text/revision")
+        if question["question_digest"] != scope_question_digest(state["run_id"], question):
+            raise ValueError("scope question digest does not match its run, ID, text, or revision")
+        if not isinstance(question["paths"], list) or any(not isinstance(item, str) or not item.strip()
+                                                          for item in question["paths"]):
+            raise ValueError("scope question paths must be strings")
+        if not isinstance(question.get("dependent_paths", []), list) \
+                or any(not isinstance(item, str) or not item.strip()
+                       for item in question.get("dependent_paths", [])):
+            raise ValueError("scope question dependent_paths must be strings")
+        identifiers.add(question["id"])
+    return value
+
+
 def plans(run_dir: Path, state: dict) -> tuple[dict, dict]:
     for name in ("verification-plan.json", "qa-plan.json"):
         require_artifact(run_dir, name)
+    if state["version"] >= 8:
+        validate_official_sources(run_dir)
+        scope_register(run_dir, state)
     checks = json.loads((run_dir / "verification-plan.json").read_text(encoding="utf-8"))
     cases = json.loads((run_dir / "qa-plan.json").read_text(encoding="utf-8"))
     impact_map(run_dir, state)
@@ -410,11 +505,380 @@ def plans(run_dir: Path, state: dict) -> tuple[dict, dict]:
     return checks, cases
 
 
-def plan_digests(run_dir: Path) -> dict[str, str]:
+def plan_digests(run_dir: Path, state: dict | None = None) -> dict[str, str]:
     names = ["verification-plan.json", "qa-plan.json"]
-    if (run_dir / "impact-map.json").exists():
+    if (run_dir / "impact-map.json").exists() or (run_dir / "impact-map.json").is_symlink():
         names.append("impact-map.json")
-    return {name: artifact_digest(run_dir, name) for name in names}
+    if state is not None and state.get("version", 0) >= 8:
+        names.append("official-sources.json")
+    digests = {name: artifact_digest(run_dir, name) for name in names}
+    if state is not None and state.get("version", 0) >= 8:
+        register = scope_register_data(state)
+        approved = [{key: question.get(key) for key in
+                     ("id", "kind", "question", "paths", "impact", "dependent_paths", "status")}
+                    for question in register["questions"] if question["status"] == "approved"]
+        digests["approved-scope"] = hashlib.sha256(json.dumps(
+            approved, sort_keys=True, ensure_ascii=False, separators=(",", ":")).encode("utf-8")).hexdigest()
+    return digests
+
+
+def scope_question_digest(run_id: str, question: dict) -> str:
+    payload = {key: question[key] for key in
+               ("id", "kind", "question", "paths", "impact", "dependent_paths", "run_id", "revision")}
+    payload["run_id"] = run_id
+    return hashlib.sha256(json.dumps(payload, sort_keys=True, ensure_ascii=False,
+                                     separators=(",", ":")).encode("utf-8")).hexdigest()
+
+
+def scope_register(run_dir: Path, state: dict) -> dict:
+    value = scope_register_data(state)
+    path = run_dir / "scope-register.json"
+    try:
+        current = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError, json.JSONDecodeError):
+        current = None
+    if current != value:
+        write_json_atomic(path, value)
+    return validate_scope_register(run_dir, state)
+
+
+def scope_register_data(state: dict) -> dict:
+    questions = {}
+    for event in state["events"]:
+        if event.get("type") in {"scope-question", "scope-answer"} \
+                and isinstance(event.get("question_state"), dict):
+            item = event["question_state"]
+            questions[item["id"]] = json.loads(json.dumps(item))
+    return {"schema_version": 1, "questions": list(questions.values())}
+
+
+def unresolved_required_decisions(register: dict) -> list[dict]:
+    return [question for question in register["questions"]
+            if question["kind"] == "required_decision"
+            and question["status"] in {"declined", "unanswered"}]
+
+
+def has_current_incomplete_report(run_dir: Path, state: dict, register: dict) -> bool:
+    report = run_dir / "final-report.md"
+    scope_file = run_dir / "scope-register.json"
+    if report.is_symlink() or scope_file.is_symlink() or not report.is_file() or not scope_file.is_file():
+        return False
+    report_digest = hashlib.sha256(report.read_bytes()).hexdigest()
+    report_binding = dict(current_binding(run_dir, state))
+    report_binding["questions"] = hashlib.sha256(scope_file.read_bytes()).hexdigest()
+    return any(event.get("type") == "report-published"
+               and event.get("run_id") == state["run_id"]
+               and event.get("status") == "incomplete"
+               and event.get("binding") == report_binding
+               and event.get("report_digest") == report_digest
+               for event in state["events"])
+
+
+def write_json_atomic(path: Path, value: dict) -> None:
+    temporary = path.with_name(f".{path.name}.{uuid.uuid4().hex}.tmp")
+    temporary.write_text(json.dumps(value, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+    os.replace(temporary, path)
+
+
+def serialized_json(value: dict) -> bytes:
+    return (json.dumps(value, ensure_ascii=False, indent=2) + "\n").encode("utf-8")
+
+
+def stage_transaction_file(run_dir: Path, name: str, content: bytes) -> dict:
+    with tempfile.NamedTemporaryFile(mode="wb", dir=run_dir, prefix=f".{name}-", suffix=".tmp",
+                                     delete=False) as handle:
+        handle.write(content)
+        handle.flush()
+        os.fsync(handle.fileno())
+        temporary = Path(handle.name)
+    return {"temporary": temporary.name, "target": name,
+            "digest": hashlib.sha256(content).hexdigest()}
+
+
+def recover_file_transaction(run_dir: Path, journal_name: str, expected_targets: set[str],
+                             label: str) -> None:
+    journal_path = run_dir / journal_name
+    if not journal_path.exists():
+        return
+    if journal_path.is_symlink() or not journal_path.is_file():
+        raise ValueError(f"{label} recovery journal must be a local regular file")
+    journal = json.loads(journal_path.read_text(encoding="utf-8"))
+    if journal.get("schema_version") != 1 or not isinstance(journal.get("files"), list):
+        raise ValueError(f"invalid {label} recovery journal")
+    if {item.get("target") for item in journal["files"] if isinstance(item, dict)} != expected_targets:
+        raise ValueError(f"{label} journal has an unexpected target")
+    for item in journal["files"]:
+        temporary_name = item.get("temporary")
+        target_name = item.get("target")
+        if not isinstance(temporary_name, str) or Path(temporary_name).name != temporary_name \
+                or target_name not in expected_targets:
+            raise ValueError(f"{label} journal path is invalid")
+        if not temporary_name.startswith(f".{target_name}-") or not temporary_name.endswith(".tmp"):
+            raise ValueError(f"{label} temporary path is invalid")
+        temporary = run_dir / temporary_name
+        target = run_dir / target_name
+        if temporary.is_symlink() or target.is_symlink():
+            raise ValueError(f"{label} target cannot be a symbolic link")
+        if temporary.exists():
+            digest = hashlib.sha256(temporary.read_bytes()).hexdigest()
+            if digest != item.get("digest"):
+                raise ValueError(f"staged {label} file digest differs")
+            os.replace(temporary, target)
+        elif not target.is_file() or hashlib.sha256(target.read_bytes()).hexdigest() != item.get("digest"):
+            raise ValueError(f"{label} cannot be recovered from staged files")
+    journal_path.unlink()
+
+
+def recover_report_publish(run_dir: Path) -> None:
+    recover_file_transaction(run_dir, ".report-publish.pending.json",
+                             {"final-report.md", "scope-register.json", "state.json"},
+                             "report publication")
+
+
+def recover_legacy_migration(run_dir: Path) -> None:
+    journal_path = run_dir / ".legacy-migration.pending.json"
+    if not journal_path.exists():
+        return
+    if journal_path.is_symlink() or not journal_path.is_file():
+        raise ValueError("legacy migration recovery journal must be a local regular file")
+    try:
+        journal = json.loads(journal_path.read_text(encoding="utf-8"))
+    except (OSError, ValueError, json.JSONDecodeError) as error:
+        raise ValueError("invalid legacy migration recovery journal") from error
+    targets = {"official-sources.json", "scope-register.json", "state.json"}
+    snapshot = journal.get("snapshot_target") if isinstance(journal, dict) else None
+    if not isinstance(snapshot, str) or not re.fullmatch(r"legacy-state-v[2-7]\.json", snapshot):
+        raise ValueError("legacy migration snapshot target is invalid")
+    recover_file_transaction(run_dir, ".legacy-migration.pending.json", targets | {snapshot},
+                             "legacy migration")
+
+
+def changed_code_paths(state: dict) -> list[str]:
+    paths = set()
+    area_repos = {area: repo_for_area(state, area).resolve() for area in areas_for(state["scope"])}
+    for area, repo in area_repos.items():
+        base = state.get("base_commits", {}).get(area)
+        if base and subprocess.run(["git", "-C", str(repo), "rev-parse", "--verify", base],
+                                   capture_output=True).returncode == 0:
+            tracked = git_output(repo, "diff", "--name-only", "--no-renames", base, "-z", "--")
+        else:
+            tracked = b""
+        untracked = git_output(repo, "ls-files", "--others", "--exclude-standard", "-z")
+        for raw in (tracked + b"\0" + untracked).split(b"\0"):
+            if raw:
+                paths.add(f"{area}:{os.fsdecode(raw)}")
+    if state["scope"] == "both":
+        integration_repo = repo_for_area(state, "integration").resolve()
+        if integration_repo not in area_repos.values():
+            base = state.get("base_commits", {}).get("integration")
+            if base and subprocess.run(["git", "-C", str(integration_repo), "rev-parse", "--verify", base],
+                                       capture_output=True).returncode == 0:
+                tracked = git_output(integration_repo, "diff", "--name-only", "--no-renames", base, "-z", "--")
+            else:
+                tracked = b""
+            untracked = git_output(integration_repo, "ls-files", "--others", "--exclude-standard", "-z")
+            for raw in (tracked + b"\0" + untracked).split(b"\0"):
+                if raw:
+                    paths.add(f"integration:{os.fsdecode(raw)}")
+    return sorted(paths)
+
+
+def markdown_cell(value: str) -> str:
+    return value.replace("|", "\\|").replace("\r", " ").replace("\n", " ").strip()
+
+
+def markdown_text(value: str) -> str:
+    text = markdown_cell(str(value))
+    return re.sub(r"([\\`*_{}\[\]()#+\-.!|><])", r"\\\1", text)
+
+
+def changed_code_lines(state: dict, qualified_path: str) -> set[tuple[str, int]]:
+    area, relative = qualified_path.split(":", 1)
+    repo = repo_for_area(state, area).resolve()
+    untracked = {os.fsdecode(item) for item in
+                 git_output(repo, "ls-files", "--others", "--exclude-standard", "-z").split(b"\0")
+                 if item}
+    path = repo / relative
+    if relative in untracked and path.is_file() and not path.is_symlink():
+        return {("new", line) for line in
+                range(1, len(path.read_text(encoding="utf-8").splitlines()) + 1)}
+    base = state.get("base_commits", {}).get(area)
+    if base and subprocess.run(["git", "-C", str(repo), "rev-parse", "--verify", base],
+                               capture_output=True).returncode == 0:
+        result = subprocess.run(["git", "-C", str(repo), "diff", "--unified=0",
+                                 "--no-renames", base, "--", relative],
+                                capture_output=True, text=True)
+        if result.returncode != 0:
+            raise ValueError(f"cannot inspect changed code lines: {qualified_path}")
+        changed = set()
+        for match in re.finditer(r"@@ -(\d+)(?:,(\d+))? \+(\d+)(?:,(\d+))? @@", result.stdout):
+            old_start, old_count, new_start, new_count = match.groups()
+            old_start, new_start = int(old_start), int(new_start)
+            old_count = int(old_count) if old_count is not None else 1
+            new_count = int(new_count) if new_count is not None else 1
+            if new_count:
+                changed.update(("new", line) for line in range(new_start, new_start + new_count))
+            if old_count:
+                changed.update(("old", line) for line in range(old_start, old_start + old_count))
+        return changed
+    if path.is_file() and not path.is_symlink():
+        return {("new", line) for line in
+                range(1, len(path.read_text(encoding="utf-8").splitlines()) + 1)}
+    return set()
+
+
+def validate_report_sections(content: str, changed: list[str],
+                             changed_lines: dict[str, set[tuple[str, int]]] | None = None,
+                             baseline_objects: dict[str, str] | None = None) -> None:
+    headings = ("## 변경 파일 및 코드 위치", "## 동작 원리", "## 검증 결과",
+                "## 요청 밖 문제 및 질문")
+    lines = content.splitlines()
+    sections = {}
+    for index, line in enumerate(lines):
+        if line in headings:
+            if line in sections:
+                raise ValueError(f"report section is duplicated: {line}")
+            end = next((position for position in range(index + 1, len(lines))
+                        if lines[position].startswith("## ")), len(lines))
+            body = "\n".join(lines[index + 1:end]).strip()
+            if not body:
+                raise ValueError(f"report section is empty: {line}")
+            sections[line] = body
+    if set(sections) != set(headings):
+        missing = [heading for heading in headings if heading not in sections]
+        raise ValueError("report draft is missing required sections: " + ", ".join(missing))
+    file_section = sections[headings[0]]
+    code_extensions = {".c", ".cc", ".cpp", ".cs", ".go", ".h", ".hpp", ".java", ".js",
+                       ".jsx", ".kt", ".php", ".py", ".rb", ".rs", ".scala", ".sql", ".swift",
+                       ".ts", ".tsx"}
+    for path in changed:
+        if path not in file_section:
+            raise ValueError("report draft omits changed code paths: " + path)
+        suffix = Path(path.split(":", 1)[-1]).suffix.casefold()
+        citation_pattern = re.escape(path) + r":(new|old):(\d+)\b(?:\s+\(baseline:([0-9a-f]{40})\))?"
+        if suffix in code_extensions and not re.search(citation_pattern, file_section):
+            raise ValueError("report needs a new-side or old-side line location for changed code: " + path)
+        if suffix in code_extensions and changed_lines is not None:
+            area = path.split(":", 1)[0]
+            expected_baseline = (baseline_objects or {}).get(area)
+            found_location = False
+            for match in re.finditer(citation_pattern, file_section):
+                side, line_number, baseline = match.groups()
+                if (side == "old" and baseline != expected_baseline) or (side == "new" and baseline is not None):
+                    raise ValueError("report line location has an invalid baseline: " + path)
+                if (side, int(line_number)) not in changed_lines.get(path, set()):
+                    raise ValueError("report line location is not a changed code line: " + path)
+                found_location = True
+            if not found_location:
+                raise ValueError("report needs a new-side or old-side line location for changed code: " + path)
+
+
+def hook_path_conflicts(state: dict) -> list[tuple[str, str, list[str]]]:
+    conflicts = []
+    plugin_hooks = (Path(__file__).resolve().parent.parent / "git-hooks").resolve()
+    for area in review_areas(state["scope"]):
+        repo = repo_for_area(state, area)
+        configured = subprocess.run(
+            ["git", "-C", str(repo), "config", "--show-origin", "--show-scope",
+             "--get-all", "core.hooksPath"], capture_output=True, text=True)
+        effective = subprocess.run(["git", "-C", str(repo), "config", "--get", "core.hooksPath"],
+                                   capture_output=True, text=True)
+        if effective.returncode == 0 and effective.stdout.strip():
+            value = Path(effective.stdout.strip())
+            path = (value if value.is_absolute() else repo / value).resolve()
+            origins = [line.strip() for line in configured.stdout.splitlines() if line.strip()]
+        else:
+            default = subprocess.run(["git", "-C", str(repo), "rev-parse", "--git-path", "hooks"],
+                                     capture_output=True, text=True)
+            if default.returncode != 0 or not default.stdout.strip():
+                conflicts.append((area, "확인 불가", ["Git 기본 훅 경로를 조회하지 못함"]))
+                continue
+            value = Path(default.stdout.strip())
+            path = (value if value.is_absolute() else repo / value).resolve()
+            origins = ["Git 기본 경로 (`core.hooksPath` 미설정)"]
+        if path != plugin_hooks:
+            conflicts.append((area, str(path), origins))
+    return conflicts
+
+
+def publish_report(run_dir: Path, state: dict, draft_path: Path) -> tuple[str, str]:
+    draft_abs = lexical_absolute(draft_path)
+    if not within(draft_abs, run_dir) or not within(draft_abs.resolve(), run_dir.resolve()) \
+            or draft_abs.is_symlink() or not draft_abs.is_file():
+        raise ValueError("report draft must be a regular file inside the local run directory")
+    content = draft_abs.read_text(encoding="utf-8")
+    sources = validate_official_sources(run_dir) if state["version"] >= 8 else None
+    register = scope_register_data(state) if state["version"] >= 8 else {"questions": []}
+    candidate_state = json.loads(json.dumps(state))
+    for question in register["questions"]:
+        if question["status"] == "pending":
+            question["status"] = "unanswered"
+            question["revision"] += 1
+            question["question_digest"] = scope_question_digest(candidate_state["run_id"], question)
+            candidate_state["events"].append({"type": "scope-answer", "run_id": candidate_state["run_id"],
+                                              "question_id": question["id"], "status": "unanswered",
+                                              "revision": question["revision"],
+                                              "question_digest": question["question_digest"],
+                                              "question_state": json.loads(json.dumps(question)),
+                                              "reference": "report publication closed the pending question"})
+    register = scope_register_data(candidate_state) if state["version"] >= 8 else register
+    changed = changed_code_paths(state)
+    changed_lines = {path: changed_code_lines(state, path) for path in changed
+                     if Path(path.split(":", 1)[-1]).suffix.casefold() in
+                     {".c", ".cc", ".cpp", ".cs", ".go", ".h", ".hpp", ".java", ".js",
+                      ".jsx", ".kt", ".php", ".py", ".rb", ".rs", ".scala", ".sql", ".swift",
+                      ".ts", ".tsx"}}
+    validate_report_sections(content, changed, changed_lines, state.get("base_commits", {}))
+    hook_conflicts = hook_path_conflicts(state)
+    status = "incomplete" if unresolved_required_decisions(register) else "complete"
+    lines = [content.rstrip(), "", "## 실행 상태", "", f"- status: **{status}**", ""]
+    if hook_conflicts:
+        lines += ["## 로컬 문서 guard 훅 설정", "",
+                  "현재 유효한 `core.hooksPath`가 플러그인 guard 경로와 달라 guard가 자동 실행되지 않을 수 있습니다. 설정과 기존 훅은 변경하지 않았습니다.", ""]
+        for area, effective_path, origins in hook_conflicts:
+            lines += [f"### {area}", "", f"- 유효 경로: `{effective_path}`"]
+            lines += [f"- 설정 출처: `{origin}`" for origin in origins] or ["- 설정 출처: 확인할 수 없음"]
+            lines.append("")
+    if register["questions"]:
+        lines += ["## 요청 밖 문제 및 질문 상태", "",
+                  "| ID | 종류 | 질문 | 상태 | 경로 | 영향 |", "| --- | --- | --- | --- | --- | --- |"]
+        for question in register["questions"]:
+            row = (question["id"], question["kind"], question["question"], question["status"],
+                   ", ".join(question["paths"]), question["impact"])
+            lines.append("| " + " | ".join(markdown_cell(str(value)) for value in row) + " |")
+        lines.append("")
+    if sources and sources.get("status") == "applicable":
+        lines += ["## 공식 문서 근거", ""]
+        for source in sources["sources"]:
+            source_id = markdown_text(source["id"])
+            source_url = quote(source["url"], safe=":/?#@!$&'*+,;=%")
+            title = markdown_text(source["title"])
+            version = markdown_text(source["version"])
+            detected_version = markdown_text(source["detected_version"])
+            version_source = markdown_text(source["version_source"])
+            checked_on = markdown_text(source["checked_on"])
+            claims = "; ".join(markdown_text(item) for item in source["claims"])
+            applied_to = "; ".join(markdown_text(item) for item in source["applied_to"])
+            lines.append(f"- [{source_id}]({source_url}) — {title} "
+                         f"(문서 버전 {version}, 감지 버전 {detected_version} "
+                         f"— 근거: {version_source}, 확인 {checked_on}) — "
+                         f"주장: {claims} — 적용 대상: {applied_to}")
+    final_content = "\n".join(lines).rstrip() + "\n"
+    binding = dict(current_binding(run_dir, candidate_state))
+    if state["version"] >= 8:
+        binding["questions"] = hashlib.sha256(serialized_json(register)).hexdigest()
+    report_digest = hashlib.sha256(final_content.encode("utf-8")).hexdigest()
+    candidate_state["events"].append({"type": "report-published", "run_id": state["run_id"],
+                                      "status": status, "binding": binding,
+                                      "report_digest": report_digest,
+                                      "published_at": datetime.now(timezone.utc).isoformat()})
+    staged = [stage_transaction_file(run_dir, "final-report.md", final_content.encode("utf-8")),
+              stage_transaction_file(run_dir, "scope-register.json", serialized_json(register)),
+              stage_transaction_file(run_dir, "state.json", serialized_json(candidate_state))]
+    write_json_atomic(run_dir / ".report-publish.pending.json",
+                      {"schema_version": 1, "files": staged})
+    recover_report_publish(run_dir)
+    return status, report_digest
 
 
 def current_design_digests(run_dir: Path, state: dict) -> dict[str, str]:
@@ -425,7 +889,7 @@ def require_design_gate(run_dir: Path, state: dict) -> None:
     checks, cases = plans(run_dir, state)
     del checks, cases
     expected_design = current_design_digests(run_dir, state)
-    expected_plans = plan_digests(run_dir)
+    expected_plans = plan_digests(run_dir, state)
     if not any(event["type"] == "design-gate-passed" and event["digests"] == expected_design
                and event["plans"] == expected_plans for event in state["events"]):
         raise ValueError("current design and plans need a passed design gate")
@@ -477,7 +941,7 @@ def verify_all_evidence(run_dir: Path, state: dict) -> None:
         if digest != event["evidence_digest"]:
             raise ValueError(f"evidence changed after recording: {event['evidence_file']}")
         if state["version"] >= 5 and event["type"] == "check":
-            verify_manifest_binding(run_dir, state, event)
+            verify_manifest_binding(run_dir, state, event, historical=True)
     if state["version"] >= 5:
         for event in state["events"]:
             if event.get("type") not in {"review", "code-review", "qa"}:
@@ -719,7 +1183,7 @@ def approved_finding(run_dir: Path, state: dict, area: str, index: int) -> bool:
             current_digest = design_digest(run_dir, area)
         except (OSError, ValueError):
             current_digest = None
-        required_plans = (plan_digests(run_dir) if finding["digest"] == current_digest
+        required_plans = (plan_digests(run_dir, state) if finding["digest"] == current_digest
                           else finding.get("plans"))
     for approval in state["events"][index + 1:]:
         if approval.get("type") != "approval" or approval.get("area") != area \
@@ -759,7 +1223,7 @@ def check_reviews_v3(run_dir: Path, state: dict) -> None:
         for slot, event in latest.items():
             if state["version"] >= 4 and event.get("focus") != focus_for("design-review", area, slot, review_depth(state)):
                 raise ValueError(f"design review focus does not match slot: {area} {slot}")
-            if state["version"] >= 4 and event.get("plans") != plan_digests(run_dir):
+            if state["version"] >= 4 and event.get("plans") != plan_digests(run_dir, state):
                 raise ValueError(f"design review predates the current plans: {area} {slot}")
             name = agent_artifact("design-review", area, slot)
             if artifact_digest(run_dir, name) != event["artifact_digest"]:
@@ -797,7 +1261,7 @@ def check_agent_stage(run_dir: Path, state: dict, stage: str, area: str, digest:
     for slot, event in latest.items():
         if state["version"] >= 4 and event.get("focus") != focus_for(stage, area, slot, review_depth(state)):
             raise ValueError(f"{stage} focus does not match slot: {area} {slot}")
-        if state["version"] >= 4 and event.get("plans") != plan_digests(run_dir):
+        if state["version"] >= 4 and event.get("plans") != plan_digests(run_dir, state):
             raise ValueError(f"{stage} predates the current plans: {area} {slot}")
         if state["version"] >= 4:
             event_index = next(index for index in range(len(state["events"]) - 1, -1, -1)
@@ -850,7 +1314,7 @@ def check_v4_checks(run_dir: Path, state: dict, area: str) -> None:
     checks, _ = plans(run_dir, state)
     current_code = code_digest_for(run_dir, state, area)
     current_design = design_digest(run_dir, area)
-    current_plans = plan_digests(run_dir)
+    current_plans = plan_digests(run_dir, state)
     for item in checks[area]:
         records = latest_events(state, "check", area, "name", item["id"], current_code, current_design)
         records = [record for record in records if record.get("plans") == current_plans]
@@ -878,7 +1342,7 @@ def check_v4_cases(run_dir: Path, state: dict, area: str, slot: int | None = Non
     _, cases = plans(run_dir, state)
     current_code = code_digest_for(run_dir, state, area)
     current_design = design_digest(run_dir, area)
-    current_plans = plan_digests(run_dir)
+    current_plans = plan_digests(run_dir, state)
     for scenario in cases[area]:
         if slot is not None and scenario["slot"] != slot:
             continue
@@ -925,6 +1389,25 @@ def check_final_v4(run_dir: Path, state: dict) -> None:
         check_v4_cases(run_dir, state, area)
         check_agent_stage(run_dir, state, "qa", area, code_digest_for(run_dir, state, area))
     verify_all_evidence(run_dir, state)
+    if state["version"] >= 8:
+        register = scope_register(run_dir, state)
+        if any(question["status"] == "pending" for question in register["questions"]):
+            raise ValueError("pending scope questions must be closed in the final report")
+        if unresolved_required_decisions(register):
+            ids = ", ".join(question["id"] for question in unresolved_required_decisions(register))
+            raise ValueError("unresolved required decision prevents completion: " + ids)
+        current_report = run_dir / "final-report.md"
+        report_digest = hashlib.sha256(current_report.read_bytes()).hexdigest()
+        report_binding = dict(current_binding(run_dir, state))
+        report_binding["questions"] = hashlib.sha256(
+            (run_dir / "scope-register.json").read_bytes()).hexdigest()
+        if not any(event.get("type") == "report-published"
+                   and event.get("run_id") == state["run_id"]
+                   and event.get("status") == "complete"
+                   and event.get("binding") == report_binding
+                   and event.get("report_digest") == report_digest
+                   for event in state["events"]):
+            raise ValueError("current final report must be atomically published for current evidence")
 
 
 def check_final(run_dir: Path, state: dict) -> None:
@@ -965,7 +1448,7 @@ def check_final(run_dir: Path, state: dict) -> None:
 
 def current_binding(run_dir: Path, state: dict) -> dict:
     return {"design": current_design_digests(run_dir, state),
-            "plans": plan_digests(run_dir),
+            "plans": plan_digests(run_dir, state),
             "code": {area: code_digest_for(run_dir, state, area)
                      for area in review_areas(state["scope"])}}
 
@@ -984,8 +1467,103 @@ def completed_run(run_dir: Path, state: dict) -> bool:
         return False
 
 
+def legacy_run_complete(run_dir: Path, state: dict) -> bool:
+    if state.get("version", 0) >= 7:
+        return completed_run(run_dir, state)
+    try:
+        check_final(run_dir, state)
+        return True
+    except (OSError, ValueError, KeyError, json.JSONDecodeError):
+        return False
+
+
+def parse_legacy_bases(values: list[str]) -> dict[str, str]:
+    parsed = {}
+    for value in values:
+        area, separator, reference = value.partition("=")
+        if not separator or area not in {"frontend", "backend", "integration"} \
+                or not reference.strip() or area in parsed:
+            raise ValueError("--legacy-base must be a unique AREA=REF value")
+        parsed[area] = reference.strip()
+    return parsed
+
+
+def migrate_run_to_v8(run_dir: Path, state: dict,
+                      legacy_bases: dict[str, str] | None = None) -> dict:
+    if (run_dir / ".legacy-migration.pending.json").exists():
+        recover_legacy_migration(run_dir)
+        return read_state(run_dir)
+    if state.get("version", 0) >= 8:
+        return state
+    if legacy_run_complete(run_dir, state):
+        raise ValueError("completed legacy run is historical; use --new-run for new work")
+    original = json.loads(json.dumps(state))
+    original_version = state["version"]
+    snapshot_name = f"legacy-state-v{original_version}.json"
+    snapshot = run_dir / snapshot_name
+    snapshot_content = serialized_json(original)
+    if snapshot.exists():
+        saved = json.loads(snapshot.read_text(encoding="utf-8"))
+        if saved != original:
+            raise ValueError("legacy migration snapshot conflicts with the current state")
+    roots = state.get("repo_roots") or {
+        area: str(Path(state["repo_root"]).resolve()) for area in review_areas(state["scope"])
+    }
+    checkouts = state.get("checkout_ids") or {
+        area: checkout_identity(Path(roots[area])) for area in review_areas(state["scope"])
+    }
+    base_commits = state.get("base_commits", {})
+    missing_baselines = [area for area in review_areas(state["scope"])
+                         if not base_commits.get(area)
+                         or subprocess.run(["git", "-C", roots[area], "rev-parse", "--verify",
+                                            base_commits[area]], capture_output=True).returncode != 0]
+    legacy_bases = legacy_bases or {}
+    if set(legacy_bases) != set(missing_baselines):
+        if missing_baselines:
+            raise ValueError("legacy migration needs a trustworthy start commit; pass "
+                             "--legacy-base AREA=REF for: " + ", ".join(missing_baselines))
+        if legacy_bases:
+            raise ValueError("--legacy-base was supplied but the legacy run already has valid baselines")
+    for area in missing_baselines:
+        repo = roots[area]
+        resolved = subprocess.run(["git", "-C", repo, "rev-parse", "--verify",
+                                   f"{legacy_bases[area]}^{{commit}}"],
+                                  capture_output=True, text=True)
+        if resolved.returncode != 0:
+            raise ValueError(f"legacy baseline is not a commit in the {area} repository")
+        head = subprocess.run(["git", "-C", repo, "rev-parse", "--verify", "HEAD"],
+                              capture_output=True, text=True)
+        if head.returncode == 0 and subprocess.run(
+                ["git", "-C", repo, "merge-base", "--is-ancestor", resolved.stdout.strip(), "HEAD"],
+                capture_output=True).returncode != 0:
+            raise ValueError(f"legacy baseline is not an ancestor of current {area} HEAD")
+        base_commits[area] = resolved.stdout.strip()
+    state.update({"version": 8, "repo_roots": roots, "checkout_ids": checkouts,
+                  "base_commits": base_commits, "review_depth": state.get("review_depth", "full"),
+                  "risk_reason": state.get("risk_reason", ""), "policy_version": 1,
+                  "policy_migration": {"from_version": original_version,
+                                       "at": datetime.now(timezone.utc).isoformat(),
+                                       "snapshot": snapshot_name,
+                                       "snapshot_digest": hashlib.sha256(snapshot_content).hexdigest()}})
+    state["initial_code_digests"] = {
+        area: code_digest_for(run_dir, state, area) for area in areas_for(state["scope"])
+    }
+    staged = [
+        stage_transaction_file(run_dir, "official-sources.json",
+                               serialized_json({"schema_version": 1, "status": "pending", "sources": []})),
+        stage_transaction_file(run_dir, "scope-register.json",
+                               serialized_json({"schema_version": 1, "questions": []})),
+        stage_transaction_file(run_dir, snapshot_name, snapshot_content),
+        stage_transaction_file(run_dir, "state.json", serialized_json(state)),
+    ]
+    write_json_atomic(run_dir / ".legacy-migration.pending.json",
+                      {"schema_version": 1, "snapshot_target": snapshot_name, "files": staged})
+    recover_legacy_migration(run_dir)
+    return read_state(run_dir)
+
+
 def workflow_status(run_dir: Path, state: dict) -> dict:
-    if completed_run(run_dir, state):
+    if (state.get("version", 0) < 7 and legacy_run_complete(run_dir, state)) or completed_run(run_dir, state):
         return {"stage": "complete", "next_action": "none", "blocker": None, "complete": True}
     for area in review_areas(state["scope"]):
         findings = [(index, event) for index, event in enumerate(state["events"])
@@ -999,6 +1577,9 @@ def workflow_status(run_dir: Path, state: dict) -> dict:
         check_design(run_dir, state)
     except (OSError, ValueError, KeyError, json.JSONDecodeError) as error:
         message = str(error)
+        if state.get("version", 0) >= 8 and "official source" in message:
+            return {"stage": "design-input", "next_action": "prepare-official-sources",
+                    "blocker": message, "complete": False}
         waiting = "user" in message or "approval" in message
         return {"stage": "design-review", "next_action": "wait-user" if waiting else "review-design",
                 "blocker": message, "complete": False}
@@ -1033,6 +1614,24 @@ def workflow_status(run_dir: Path, state: dict) -> dict:
         except (OSError, ValueError, KeyError, json.JSONDecodeError) as error:
             return {"stage": "qa", "next_action": "run-qa",
                     "blocker": str(error), "complete": False}
+    if state.get("version", 0) >= 8:
+        try:
+            register = scope_register(run_dir, state)
+            unresolved = unresolved_required_decisions(register)
+            current_questions = hashlib.sha256((run_dir / "scope-register.json").read_bytes()).hexdigest()
+            report_binding = dict(current_binding(run_dir, state))
+            report_binding["questions"] = current_questions
+            if unresolved and any(event.get("type") == "report-published"
+                                  and event.get("status") == "incomplete"
+                                  and event.get("binding") == report_binding
+                                  and event.get("report_digest") == hashlib.sha256(
+                                      (run_dir / "final-report.md").read_bytes()).hexdigest()
+                                  for event in state["events"]):
+                return {"stage": "incomplete", "next_action": "resolve-required-decision",
+                        "blocker": "required decisions remain declined or unanswered",
+                        "complete": False}
+        except (OSError, ValueError, KeyError, json.JSONDecodeError):
+            pass
     try:
         check_final(run_dir, state)
     except (OSError, ValueError, KeyError, json.JSONDecodeError) as error:
@@ -1051,18 +1650,22 @@ def main() -> int:
     initialize.add_argument("--backend-repo", type=Path)
     initialize.add_argument("--integration-repo", type=Path)
     initialize.add_argument("--new-run", action="store_true")
-    initialize.add_argument("--scope", choices=("frontend", "backend", "both"), required=True)
-    initialize.add_argument("--review-mode", choices=("immediate", "user-review"), required=True)
-    initialize.add_argument("--mode-reference", required=True,
+    initialize.add_argument("--scope", choices=("frontend", "backend", "both"))
+    initialize.add_argument("--review-mode", choices=("immediate", "user-review"))
+    initialize.add_argument("--mode-reference",
                             help="Reference to the user's answer for this implementation request")
-    initialize.add_argument("--review-depth", choices=("light", "full"), default="full")
+    initialize.add_argument("--review-depth", choices=("light", "full"))
     initialize.add_argument("--risk-reason", default="")
     initialize.add_argument("--run-dir", type=Path)
     initialize.add_argument("--parent-dir", type=Path,
                             help="Existing branch or work folder under ~/Documents/docs")
     initialize.add_argument("--work-item", help="Stable name for the current work item")
+    initialize.add_argument("--resume-run", type=Path, help="Resume one exact existing local run")
+    initialize.add_argument("--legacy-base", action="append", default=[], metavar="AREA=REF",
+                            help="Trusted start commit for a legacy run missing its baseline; repeat per area")
     for command in ("present", "review", "approve", "accept-design", "agent-result", "resolve-agent",
-                    "check-record", "resolve-check", "qa-case", "resolve-qa-case", "check", "status"):
+                    "check-record", "resolve-check", "qa-case", "resolve-qa-case",
+                    "scope-question", "scope-answer", "report-publish", "check", "status"):
         sub = commands.add_parser(command)
         sub.add_argument("--run-dir", type=Path, required=True)
         if command in {"present", "review", "approve", "agent-result", "resolve-agent", "check-record",
@@ -1126,24 +1729,80 @@ def main() -> int:
             sub.add_argument("--reference", required=True)
         elif command == "check":
             sub.add_argument("--gate", choices=("design", "final"), required=True)
+        elif command == "scope-question":
+            sub.add_argument("--question-id", required=True)
+            sub.add_argument("--kind", choices=("scope_extension", "required_decision"), required=True)
+            sub.add_argument("--question", required=True)
+            sub.add_argument("--path", action="append", default=[])
+            sub.add_argument("--dependent-path", action="append", default=[])
+            sub.add_argument("--impact", required=True)
+        elif command == "scope-answer":
+            sub.add_argument("--question-id", required=True)
+            sub.add_argument("--run-id", required=True)
+            sub.add_argument("--revision", type=int, required=True)
+            sub.add_argument("--question-digest", required=True)
+            sub.add_argument("--status", choices=("approved", "declined"), required=True)
+            sub.add_argument("--answer", default="")
+            sub.add_argument("--reference", required=True)
+        elif command == "report-publish":
+            sub.add_argument("--draft-file", type=Path, required=True)
     args = parser.parse_args()
 
     lock_handle = None
     try:
         if args.command == "init":
-            if not args.mode_reference.strip():
-                raise ValueError("--mode-reference must identify the user's answer for this request")
-            if args.scope == "both" and args.review_depth == "light":
-                raise ValueError("light review needs one area and a risk reason")
+            legacy_bases = parse_legacy_bases(args.legacy_base)
+            if legacy_bases and (not args.resume_run or args.new_run):
+                raise ValueError("--legacy-base requires exact --resume-run without --new-run")
+            if args.resume_run and (args.work_item or args.run_dir or args.parent_dir or args.new_run):
+                raise ValueError("--resume-run cannot be combined with run creation or work-item selection")
+            if args.resume_run:
+                run_dir = lexical_absolute(args.resume_run)
+                state = read_state(run_dir)
+                ensure_local_run_dir(run_dir, repo_for_area(state, areas_for(state["scope"])[0]), allow_legacy=True)
+                lock_handle = (run_dir / ".workflow-state.lock").open("a+b")
+                fcntl.flock(lock_handle, fcntl.LOCK_EX)
+                recover_report_publish(run_dir)
+                recover_legacy_migration(run_dir)
+                state = read_state(run_dir)
+                if args.scope and args.scope != state["scope"]:
+                    raise ValueError("--scope conflicts with the selected run")
+                if args.review_mode and args.review_mode != state["review_mode"]:
+                    raise ValueError("--review-mode conflicts with the selected run")
+                if args.review_depth and args.review_depth != state.get("review_depth", "full"):
+                    raise ValueError("--review-depth conflicts with the selected run")
+                requested_repos = {area: path.resolve() for area, path in {
+                    "frontend": args.frontend_repo, "backend": args.backend_repo}.items() if path}
+                if args.repo:
+                    requested_repos.update({area: args.repo.resolve() for area in areas_for(state["scope"])})
+                roots = state.get("repo_roots") or {
+                    area: state["repo_root"] for area in review_areas(state["scope"])}
+                if any(str(roots.get(area)) != str(path) for area, path in requested_repos.items()):
+                    raise ValueError("repository path conflicts with the selected run")
+                if legacy_run_complete(run_dir, state):
+                    if legacy_bases:
+                        raise ValueError("--legacy-base cannot be used with a completed historical run")
+                    print(json.dumps({"run_dir": str(run_dir), "status": "complete-history"}))
+                    return 0
+                if state["version"] < 8:
+                    state = migrate_run_to_v8(run_dir, state, legacy_bases)
+                elif legacy_bases:
+                    raise ValueError("--legacy-base can only be used when migrating a legacy run")
+                print(run_dir)
+                return 0
+
             if args.run_dir and args.parent_dir:
                 raise ValueError("--run-dir and --parent-dir cannot be used together")
             if args.work_item is not None and args.run_dir:
                 raise ValueError("--work-item cannot be combined with --run-dir")
-            if args.work_item is not None and (not args.work_item.strip()
-                    or args.work_item in {".", ".."}
+            if args.work_item is not None and (not args.work_item.strip() or args.work_item in {".", ".."}
                     or any(separator in args.work_item for separator in ("/", "\\"))):
                 raise ValueError("--work-item must be a single nonempty folder name")
-            selected = {}
+            if not args.scope:
+                raise ValueError("a new run or work-item resume needs --scope")
+            review_depth_value = args.review_depth or "full"
+            if args.scope == "both" and review_depth_value == "light":
+                raise ValueError("light review needs one area and a risk reason")
             if args.scope == "both":
                 if args.repo and not args.frontend_repo and not args.backend_repo:
                     selected = {"frontend": args.repo, "backend": args.repo}
@@ -1152,83 +1811,178 @@ def main() -> int:
                 else:
                     selected = {"frontend": args.frontend_repo, "backend": args.backend_repo}
             else:
-                path = args.frontend_repo if args.scope == "frontend" else args.backend_repo
-                path = path or args.repo
-                if path is None:
+                area_path = args.frontend_repo if args.scope == "frontend" else args.backend_repo
+                area_path = area_path or args.repo
+                if area_path is None:
                     raise ValueError("single-area scope requires --repo or its area repository")
-                selected = {args.scope: path}
+                selected = {args.scope: area_path}
             selected = {area: path.resolve() for area, path in selected.items()}
             selected["integration"] = (args.integration_repo or selected.get("backend")
                                        or selected.get("frontend")).resolve()
-            checkout_ids = {}
             repo_root = selected.get("backend") or selected["frontend"]
             if args.parent_dir and not args.parent_dir.is_dir():
                 raise ValueError("--parent-dir must be an existing folder")
-            run_dir = args.run_dir or default_run_dir(repo_root, args.work_item, args.parent_dir)
+            run_dir = lexical_absolute(args.run_dir or default_run_dir(repo_root, args.work_item, args.parent_dir))
             for area in review_areas(args.scope):
                 ensure_local_run_dir(run_dir, selected[area])
-            for area in review_areas(args.scope):
-                checkout_ids[area] = checkout_identity(selected[area])
-            run_dir = lexical_absolute(run_dir)
+            checkout_ids = {area: checkout_identity(selected[area]) for area in review_areas(args.scope)}
             parent = run_dir.parent
             with file_lock(parent / ".workflow-init.lock"):
                 if args.work_item and not args.new_run:
+                    work_item_states = []
                     candidates = []
-                    for path in parent.glob("run-*/state.json"):
+                    for state_file in parent.glob("run-*/state.json"):
                         try:
-                            summary = json.loads(path.read_text(encoding="utf-8"))
-                        except (OSError, ValueError, json.JSONDecodeError):
-                            continue
-                        if summary.get("version") != 7 or summary.get("work_item") != args.work_item:
-                            continue
-                        try:
-                            previous = read_state(path.parent)
+                            summary = json.loads(state_file.read_text(encoding="utf-8"))
+                            if summary.get("work_item") != args.work_item:
+                                continue
+                            previous = read_state(state_file.parent)
                         except (OSError, ValueError, KeyError, json.JSONDecodeError) as error:
                             raise ValueError(f"matching work item cannot be resumed: {error}") from error
-                        if previous.get("scope") != args.scope or previous.get("repo_roots") != {
-                                area: str(root) for area, root in selected.items()} or previous.get("review_mode") != args.review_mode \
-                                or previous.get("review_depth") != args.review_depth:
-                            raise ValueError("existing work item has conflicting workflow settings")
-                        if not completed_run(path.parent, previous):
-                            candidates.append(path.parent)
+                        work_item_states.append((state_file.parent, previous))
+                        roots = previous.get("repo_roots") or {
+                            area: previous["repo_root"] for area in review_areas(previous["scope"])}
+                        requested_roots_match = all(str(roots.get(area)) == str(path)
+                                                    for area, path in selected.items()
+                                                    if area in review_areas(previous["scope"]))
+                        matches = (previous["scope"] == args.scope and requested_roots_match
+                                   and all(previous.get("checkout_ids", {}).get(area, checkout_ids.get(area))
+                                           == checkout_ids.get(area)
+                                           for area in review_areas(previous["scope"])))
+                        if matches and not legacy_run_complete(state_file.parent, previous):
+                            if args.review_mode and args.review_mode != previous["review_mode"]:
+                                raise ValueError("explicit --review-mode conflicts with the saved run")
+                            if args.review_depth and args.review_depth != previous.get("review_depth", "full"):
+                                raise ValueError("explicit --review-depth conflicts with the saved run")
+                            candidates.append((state_file.parent, previous))
                     if len(candidates) > 1:
-                        raise ValueError("multiple unfinished runs match this work item")
-                    if candidates:
-                        print(candidates[0])
+                        choices = ", ".join(f"{item['run_id']}={path}" for path, item in candidates)
+                        raise ValueError("multiple unfinished runs match; select an exact --resume-run path: " + choices)
+                    if len(candidates) == 1:
+                        selected_run, previous = candidates[0]
+                        with file_lock(selected_run / ".workflow-state.lock"):
+                            recover_report_publish(selected_run)
+                            recover_legacy_migration(selected_run)
+                            current = read_state(selected_run)
+                            if current["version"] < 8:
+                                migrate_run_to_v8(selected_run, current, legacy_bases)
+                            elif legacy_bases:
+                                raise ValueError("--legacy-base can only be used when migrating a legacy run")
+                        print(selected_run)
                         return 0
-                state = {"version": 7, "run_id": uuid.uuid4().hex,
+                    if work_item_states:
+                        raise ValueError("no incomplete run matches; use --new-run for new work or --resume-run <run-dir> for existing work")
+                    if legacy_bases:
+                        raise ValueError("--legacy-base requires an existing legacy run")
+                if not args.review_mode or args.mode_reference is None:
+                    parser.error("a new run needs --review-mode and this request's --mode-reference")
+                if not args.mode_reference.strip():
+                    raise ValueError("a new run needs --review-mode and this request's --mode-reference")
+                state = {"version": 8, "policy_version": 1, "run_id": uuid.uuid4().hex,
                          "work_item": args.work_item, "repo_root": str(repo_root),
                          "repo_roots": {area: str(root) for area, root in selected.items()},
                          "checkout_ids": checkout_ids, "scope": args.scope,
                          "review_mode": args.review_mode, "mode_reference": args.mode_reference,
-                         "review_depth": args.review_depth,
+                         "review_depth": review_depth_value,
                          "risk_reason": args.risk_reason.strip(), "events": []}
                 state["base_commits"] = {}
                 for area in review_areas(args.scope):
                     result = subprocess.run(["git", "-C", str(selected[area]), "rev-parse",
                                              "--verify", "HEAD"], capture_output=True, text=True)
-                    if result.returncode == 0:
-                        state["base_commits"][area] = result.stdout.strip()
-                    else:
-                        state["base_commits"][area] = subprocess.run(
-                            ["git", "-C", str(selected[area]), "mktree"], input=b"",
-                            check=True, capture_output=True).stdout.decode().strip()
+                    state["base_commits"][area] = result.stdout.strip() if result.returncode == 0 else \
+                        subprocess.run(["git", "-C", str(selected[area]), "mktree"], input=b"",
+                                       check=True, capture_output=True).stdout.decode().strip()
                 risk_guard(state)
                 state["initial_code_digests"] = {
                     area: code_digest_for(run_dir, state, area) for area in areas_for(args.scope)}
-                run_dir.mkdir(parents=True, exist_ok=False)
-                run_dir.chmod(0o700)
-                write_state(run_dir, state)
-            print(run_dir)
-            return 0
+                staging_dir = Path(tempfile.mkdtemp(prefix=".workflow-init-", dir=parent))
+                try:
+                    staging_dir.chmod(0o700)
+                    write_state(staging_dir, state)
+                    write_json_atomic(staging_dir / "official-sources.json",
+                                      {"schema_version": 1, "status": "pending", "sources": []})
+                    write_json_atomic(staging_dir / "scope-register.json",
+                                      {"schema_version": 1, "questions": []})
+                    os.replace(staging_dir, run_dir)
+                except Exception:
+                    shutil.rmtree(staging_dir, ignore_errors=True)
+                    raise
+                print(run_dir)
+                return 0
 
         run_dir = lexical_absolute(args.run_dir)
         state = read_state(run_dir)
         lock_handle = (run_dir / ".workflow-state.lock").open("a+b")
         fcntl.flock(lock_handle, fcntl.LOCK_EX)
+        recover_report_publish(run_dir)
+        recover_legacy_migration(run_dir)
         state = read_state(run_dir)
         if args.command == "status":
             print(json.dumps(workflow_status(run_dir, state), ensure_ascii=False))
+            return 0
+        if args.command in {"scope-question", "scope-answer", "report-publish"} and state["version"] < 8:
+            raise ValueError("scope tracking and atomic report publishing require a migrated v8 run")
+        if args.command == "scope-question":
+            register = scope_register(run_dir, state)
+            if any(item["id"] == args.question_id for item in register["questions"]):
+                raise ValueError("scope question ID must be unique")
+            if not args.question.strip() or not args.impact.strip():
+                raise ValueError("scope question and impact cannot be empty")
+            question = {"id": args.question_id, "kind": args.kind, "status": "pending",
+                        "question": args.question.strip(), "paths": args.path,
+                        "dependent_paths": args.dependent_path, "impact": args.impact.strip(),
+                        "blocks_requested_work": args.kind == "required_decision",
+                        "run_id": state["run_id"], "revision": 1}
+            question["question_digest"] = scope_question_digest(state["run_id"], question)
+            question["asked_at"] = datetime.now(timezone.utc).isoformat()
+            register["questions"].append(question)
+            write_json_atomic(run_dir / "scope-register.json", register)
+            state["events"].append({"type": "scope-question", "run_id": state["run_id"],
+                                    "question_id": args.question_id, "kind": args.kind,
+                                    "question_digest": question["question_digest"],
+                                    "revision": question["revision"], "question_state": question})
+            write_state(run_dir, state)
+            print(json.dumps(question, ensure_ascii=False))
+            return 0
+        if args.command == "scope-answer":
+            if args.run_id != state["run_id"] or not args.reference.strip():
+                raise ValueError("answer must reference this run and the user's response")
+            register = scope_register(run_dir, state)
+            question = next((item for item in register["questions"]
+                             if item["id"] == args.question_id), None)
+            if question is None:
+                raise ValueError("unknown scope question ID")
+            reopen_decision = (question["kind"] == "required_decision"
+                               and question["status"] in {"declined", "unanswered"}
+                                 and has_current_incomplete_report(run_dir, state, register))
+            if (question["status"] != "pending" and not reopen_decision) \
+                    or question["revision"] != args.revision \
+                    or question["question_digest"] != args.question_digest:
+                raise ValueError("stale, duplicate, or already-closed scope answer")
+            prior_digest = question["question_digest"]
+            question.update({"status": args.status, "answer": args.answer.strip(),
+                             "answer_reference": args.reference.strip(),
+                             "answered_at": datetime.now(timezone.utc).isoformat(),
+                             "revision": question["revision"] + 1})
+            question["question_digest"] = scope_question_digest(state["run_id"], question)
+            state["events"].append({"type": "scope-answer", "run_id": state["run_id"],
+                                    "question_id": args.question_id, "status": args.status,
+                                    "revision": question["revision"], "prior_revision": args.revision,
+                                    "question_digest": prior_digest,
+                                    "resulting_digest": question["question_digest"],
+                                    "question_state": question,
+                                    "answer": args.answer.strip(),
+                                    "reference": args.reference.strip()})
+            write_state(run_dir, state)
+            write_json_atomic(run_dir / "scope-register.json", register)
+            print(json.dumps({"question_id": args.question_id, "status": args.status,
+                              "revision": question["revision"],
+                              "question_digest": question["question_digest"]}, ensure_ascii=False))
+            return 0
+        if args.command == "report-publish":
+            status, digest = publish_report(run_dir, state, args.draft_file)
+            print(json.dumps({"status": status, "report_digest": digest,
+                              "path": str(run_dir / "final-report.md")}, ensure_ascii=False))
             return 0
         if state["version"] >= 3 and args.command in {"review", "agent-result", "resolve-agent", "qa-case", "resolve-qa-case"} \
                 and args.slot not in required_slots(state):
@@ -1261,7 +2015,7 @@ def main() -> int:
                                         "artifact_digest": artifact_digest(run_dir, review_file)}
                 if state["version"] >= 4:
                     event["focus"] = args.focus
-                    event["plans"] = plan_digests(run_dir)
+                    event["plans"] = plan_digests(run_dir, state)
                 if state["version"] >= 5:
                     if not args.result_json:
                         raise ValueError("v5 design review needs --result-json")
@@ -1298,7 +2052,7 @@ def main() -> int:
                             "reference": args.reference, "digest": digest}
                 if state["version"] >= 7:
                     approval.update({"run_id": state["run_id"],
-                                     "plans": plan_digests(run_dir),
+                                     "plans": plan_digests(run_dir, state),
                                      "finding_indexes": outstanding})
                 state["events"].append(approval)
             else:
@@ -1366,7 +2120,7 @@ def main() -> int:
                                     "artifact_digest": artifact_digest(run_dir, report)}
             if state["version"] >= 4:
                 event["focus"] = args.focus
-                event["plans"] = plan_digests(run_dir)
+                event["plans"] = plan_digests(run_dir, state)
             if state["version"] >= 5:
                 if not args.result_json:
                     raise ValueError("v5 agent result needs --result-json")
@@ -1409,17 +2163,17 @@ def main() -> int:
                 current_design = design_digest(run_dir, args.area)
                 previous = latest_events(state, "check", args.area, "name", args.name,
                                          current_code, current_design)
-                previous = [record for record in previous if record.get("plans") == plan_digests(run_dir)]
+                previous = [record for record in previous if record.get("plans") == plan_digests(run_dir, state)]
                 if args.status == "pass" and previous and previous[-1]["status"] in {"fail", "not-run"}:
                     if not any(event["type"] == "check-resolution" and event["area"] == args.area
                                and event["name"] == args.name and event["digest"] == current_code
                                and event["design_digest"] == current_design
-                               and event.get("plans") == plan_digests(run_dir)
+                               and event.get("plans") == plan_digests(run_dir, state)
                                for event in state["events"][state["events"].index(previous[-1]) + 1:]):
                         raise ValueError("resolve-check is required before a passing rerun")
                 event = {"type": "check", "area": args.area, "name": args.name,
                          "status": args.status, "digest": current_code,
-                         "design_digest": current_design, "plans": plan_digests(run_dir),
+                         "design_digest": current_design, "plans": plan_digests(run_dir, state),
                          "executed_at": datetime.now(timezone.utc).isoformat()}
                 if args.status == "not-run":
                     if not args.reason or not args.reason.strip() or not args.unverified or not args.unverified.strip():
@@ -1469,12 +2223,12 @@ def main() -> int:
             current_design = design_digest(run_dir, args.area)
             previous = latest_events(state, "check", args.area, "name", args.name,
                                      current_code, current_design)
-            previous = [record for record in previous if record.get("plans") == plan_digests(run_dir)]
+            previous = [record for record in previous if record.get("plans") == plan_digests(run_dir, state)]
             if not previous or previous[-1]["status"] not in {"fail", "not-run"}:
                 raise ValueError("no current failed or unrun check to resolve")
             state["events"].append({"type": "check-resolution", "area": args.area,
                                     "name": args.name, "digest": current_code,
-                                    "design_digest": current_design, "plans": plan_digests(run_dir),
+                                    "design_digest": current_design, "plans": plan_digests(run_dir, state),
                                     "reference": args.reference.strip()})
             write_state(run_dir, state)
         elif args.command == "qa-case":
@@ -1501,12 +2255,12 @@ def main() -> int:
             current_design = design_digest(run_dir, args.area)
             previous = latest_events(state, "qa-case", args.area, "scenario_id", args.scenario_id,
                                      current_code, current_design)
-            previous = [record for record in previous if record.get("plans") == plan_digests(run_dir)]
+            previous = [record for record in previous if record.get("plans") == plan_digests(run_dir, state)]
             if args.result == "pass" and previous and previous[-1]["result"] in {"fail", "not-run"}:
                 if not any(event["type"] == "qa-resolution" and event["area"] == args.area
                            and event["scenario_id"] == args.scenario_id and event["digest"] == current_code
                            and event["design_digest"] == current_design
-                           and event.get("plans") == plan_digests(run_dir)
+                           and event.get("plans") == plan_digests(run_dir, state)
                            for event in state["events"][state["events"].index(previous[-1]) + 1:]):
                     raise ValueError("resolve-qa-case is required before a passing rerun")
             event = {"type": "qa-case", "area": args.area, "slot": args.slot,
@@ -1515,7 +2269,7 @@ def main() -> int:
                      "result": args.result, "environment": args.environment.strip(),
                      "input": args.input.strip(), "expected": scenario["expected"],
                      "actual": args.actual.strip(), "digest": current_code,
-                     "design_digest": current_design, "plans": plan_digests(run_dir),
+                     "design_digest": current_design, "plans": plan_digests(run_dir, state),
                      "executed_at": datetime.now(timezone.utc).isoformat()}
             if args.result == "not-run":
                 if not args.reason or not args.reason.strip():
@@ -1542,12 +2296,12 @@ def main() -> int:
             current_design = design_digest(run_dir, args.area)
             previous = latest_events(state, "qa-case", args.area, "scenario_id", args.scenario_id,
                                      current_code, current_design)
-            previous = [record for record in previous if record.get("plans") == plan_digests(run_dir)]
+            previous = [record for record in previous if record.get("plans") == plan_digests(run_dir, state)]
             if not previous or previous[-1]["result"] not in {"fail", "not-run"}:
                 raise ValueError("no current failed or unrun QA case to resolve")
             state["events"].append({"type": "qa-resolution", "area": args.area, "slot": args.slot,
                                     "scenario_id": args.scenario_id, "digest": current_code,
-                                    "design_digest": current_design, "plans": plan_digests(run_dir),
+                                    "design_digest": current_design, "plans": plan_digests(run_dir, state),
                                     "reference": args.reference.strip()})
             write_state(run_dir, state)
         else:
@@ -1559,7 +2313,7 @@ def main() -> int:
             if args.gate == "design" and state["version"] >= 4:
                 state["events"].append({"type": "design-gate-passed",
                                         "digests": current_design_digests(run_dir, state),
-                                        "plans": plan_digests(run_dir)})
+                                        "plans": plan_digests(run_dir, state)})
                 write_state(run_dir, state)
             if args.gate == "final" and state["version"] >= 7:
                 state["events"].append({"type": "final-gate-passed",

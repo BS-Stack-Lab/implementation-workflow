@@ -121,13 +121,20 @@ def build_plan(scope: str, review_mode: str = "immediate",
                           "depends_on": [design_dependency]})
     design_reviews = [f"review-design-{area}-{slot}" for area in areas for slot in slots]
     if scope == "both":
+        design_ready = [
+            f"present-design-{area}" if review_mode == "user-review" else f"design-{area}"
+            for area in areas
+        ]
+        contract_reviews = []
         for slot in slots:
-            tasks.append({"id": f"review-contract-{slot}", "role": f"contract-reviewer-{slot}",
+            task_id = f"review-contract-{slot}"
+            tasks.append({"id": task_id, "role": f"contract-reviewer-{slot}",
                           "focus": focus_for("design-review", "integration", slot, review_depth),
                           "question": focus_question("design-review", "integration", slot, review_depth),
                           **model_for("design-review", slot),
-                          "depends_on": design_reviews})
-        design_reviews = [f"review-contract-{slot}" for slot in slots]
+                          "depends_on": design_ready})
+            contract_reviews.append(task_id)
+        design_reviews.extend(contract_reviews)
     if review_mode == "user-review":
         tasks.append({"id": "accept-design", "role": "user", "depends_on": design_reviews})
         design_reviews = ["accept-design"]
