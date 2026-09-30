@@ -584,6 +584,11 @@ def serialized_json(value: dict) -> bytes:
     return (json.dumps(value, ensure_ascii=False, indent=2) + "\n").encode("utf-8")
 
 
+def run_policy_data(run_id: str, policy_version: int) -> dict:
+    body = {"schema_version": 1, "run_id": run_id, "policy_version": policy_version}
+    return {**body, "digest": hashlib.sha256(serialized_json(body)).hexdigest()}
+
+
 def stage_transaction_file(run_dir: Path, name: str, content: bytes) -> dict:
     with tempfile.NamedTemporaryFile(mode="wb", dir=run_dir, prefix=f".{name}-", suffix=".tmp",
                                      delete=False) as handle:
@@ -603,8 +608,13 @@ def recover_file_transaction(run_dir: Path, journal_name: str, expected_targets:
     if journal_path.is_symlink() or not journal_path.is_file():
         raise ValueError(f"{label} recovery journal must be a local regular file")
     journal = json.loads(journal_path.read_text(encoding="utf-8"))
-    if journal.get("schema_version") != 1 or not isinstance(journal.get("files"), list):
+    allowed_versions = {1, 2} if label == "report publication" else {1}
+    if not isinstance(journal, dict) or journal.get("schema_version") not in allowed_versions \
+            or not isinstance(journal.get("files"), list):
         raise ValueError(f"invalid {label} recovery journal")
+    if label == "report publication" and journal["schema_version"] == 2 \
+            and journal.get("policy_version") != 2:
+        raise ValueError("unsupported report publication policy version")
     if {item.get("target") for item in journal["files"] if isinstance(item, dict)} != expected_targets:
         raise ValueError(f"{label} journal has an unexpected target")
     for item in journal["files"]:
@@ -629,10 +639,65 @@ def recover_file_transaction(run_dir: Path, journal_name: str, expected_targets:
     journal_path.unlink()
 
 
-def recover_report_publish(run_dir: Path) -> None:
-    recover_file_transaction(run_dir, ".report-publish.pending.json",
-                             {"final-report.md", "scope-register.json", "state.json"},
-                             "report publication")
+def recover_report_publish(run_dir: Path, *, repair_legacy: bool = False) -> None:
+    journal_path = run_dir / ".report-publish.pending.json"
+    recovery_path = run_dir / ".report-publish-recovery.pending.json"
+    has_journal = journal_path.exists()
+    if not has_journal and not recovery_path.exists():
+        return
+    if recovery_path.is_symlink() or (recovery_path.exists() and not recovery_path.is_file()):
+        raise ValueError("report recovery marker must be a local regular file")
+    journal = None
+    if has_journal:
+        if journal_path.is_symlink() or not journal_path.is_file():
+            raise ValueError("report publication recovery journal must be a local regular file")
+        journal = json.loads(journal_path.read_text(encoding="utf-8"))
+    legacy_transaction = isinstance(journal, dict) and journal.get("schema_version") == 1
+    if has_journal and repair_legacy and legacy_transaction and not recovery_path.exists():
+        write_json_atomic(recovery_path, {"schema_version": 1})
+    elif recovery_path.exists():
+        marker = json.loads(recovery_path.read_text(encoding="utf-8"))
+        if not isinstance(marker, dict) or marker.get("schema_version") != 1:
+            raise ValueError("invalid report recovery marker")
+    if has_journal:
+        recover_file_transaction(run_dir, ".report-publish.pending.json",
+                                 {"final-report.md", "scope-register.json", "state.json"},
+                                 "report publication")
+    if not recovery_path.exists():
+        return
+    state_path = run_dir / "state.json"
+    if not state_path.is_file() or state_path.is_symlink():
+        return
+    state = json.loads(state_path.read_text(encoding="utf-8"))
+    events = state.get("events", [])
+    legacy_closures = []
+    if events and events[-1].get("type") == "report-published":
+        cursor = len(events) - 1
+        while cursor > 0:
+            event = events[cursor - 1]
+            if event.get("type") != "scope-answer" or event.get("run_id") != state.get("run_id") \
+                    or event.get("status") != "unanswered" \
+                    or event.get("reference") != "report publication closed the pending question":
+                break
+            legacy_closures.append(event)
+            cursor -= 1
+    if not legacy_closures:
+        if recovery_path.exists():
+            write_json_atomic(run_dir / "scope-register.json", scope_register_data(state))
+            recovery_path.unlink()
+        return
+    state["events"] = state["events"][:cursor]
+    report = run_dir / "final-report.md"
+    if report.is_symlink():
+        raise ValueError("interrupted legacy report cannot be a symbolic link")
+    if report.exists():
+        if not report.is_file():
+            raise ValueError("interrupted legacy report must be a regular file")
+        archived = run_dir / f"final-report-interrupted-{uuid.uuid4().hex}.md"
+        os.replace(report, archived)
+    write_state(run_dir, state)
+    write_json_atomic(run_dir / "scope-register.json", scope_register_data(state))
+    recovery_path.unlink()
 
 
 def recover_legacy_migration(run_dir: Path) -> None:
@@ -809,19 +874,11 @@ def publish_report(run_dir: Path, state: dict, draft_path: Path) -> tuple[str, s
     content = draft_abs.read_text(encoding="utf-8")
     sources = validate_official_sources(run_dir) if state["version"] >= 8 else None
     register = scope_register_data(state) if state["version"] >= 8 else {"questions": []}
+    pending = [question for question in register["questions"] if question["status"] == "pending"]
+    if pending:
+        ids = ", ".join(question["id"] for question in pending)
+        raise ValueError("pending user questions must be answered or declined before report publication: " + ids)
     candidate_state = json.loads(json.dumps(state))
-    for question in register["questions"]:
-        if question["status"] == "pending":
-            question["status"] = "unanswered"
-            question["revision"] += 1
-            question["question_digest"] = scope_question_digest(candidate_state["run_id"], question)
-            candidate_state["events"].append({"type": "scope-answer", "run_id": candidate_state["run_id"],
-                                              "question_id": question["id"], "status": "unanswered",
-                                              "revision": question["revision"],
-                                              "question_digest": question["question_digest"],
-                                              "question_state": json.loads(json.dumps(question)),
-                                              "reference": "report publication closed the pending question"})
-    register = scope_register_data(candidate_state) if state["version"] >= 8 else register
     changed = changed_code_paths(state)
     changed_lines = {path: changed_code_lines(state, path) for path in changed
                      if Path(path.split(":", 1)[-1]).suffix.casefold() in
@@ -876,7 +933,7 @@ def publish_report(run_dir: Path, state: dict, draft_path: Path) -> tuple[str, s
               stage_transaction_file(run_dir, "scope-register.json", serialized_json(register)),
               stage_transaction_file(run_dir, "state.json", serialized_json(candidate_state))]
     write_json_atomic(run_dir / ".report-publish.pending.json",
-                      {"schema_version": 1, "files": staged})
+                      {"schema_version": 2, "policy_version": 2, "files": staged})
     recover_report_publish(run_dir)
     return status, report_digest
 
@@ -1392,7 +1449,7 @@ def check_final_v4(run_dir: Path, state: dict) -> None:
     if state["version"] >= 8:
         register = scope_register(run_dir, state)
         if any(question["status"] == "pending" for question in register["questions"]):
-            raise ValueError("pending scope questions must be closed in the final report")
+            raise ValueError("pending user questions must be answered or declined before final completion")
         if unresolved_required_decisions(register):
             ids = ", ".join(question["id"] for question in unresolved_required_decisions(register))
             raise ValueError("unresolved required decision prevents completion: " + ids)
@@ -1617,6 +1674,12 @@ def workflow_status(run_dir: Path, state: dict) -> dict:
     if state.get("version", 0) >= 8:
         try:
             register = scope_register(run_dir, state)
+            pending = [question for question in register["questions"] if question["status"] == "pending"]
+            if pending:
+                ids = ", ".join(question["id"] for question in pending)
+                return {"stage": "awaiting-user", "next_action": "answer-question",
+                        "blocker": "pending user questions require a response: " + ids,
+                        "complete": False}
             unresolved = unresolved_required_decisions(register)
             current_questions = hashlib.sha256((run_dir / "scope-register.json").read_bytes()).hexdigest()
             report_binding = dict(current_binding(run_dir, state))
@@ -1762,7 +1825,7 @@ def main() -> int:
                 ensure_local_run_dir(run_dir, repo_for_area(state, areas_for(state["scope"])[0]), allow_legacy=True)
                 lock_handle = (run_dir / ".workflow-state.lock").open("a+b")
                 fcntl.flock(lock_handle, fcntl.LOCK_EX)
-                recover_report_publish(run_dir)
+                recover_report_publish(run_dir, repair_legacy=True)
                 recover_legacy_migration(run_dir)
                 state = read_state(run_dir)
                 if args.scope and args.scope != state["scope"]:
@@ -1861,7 +1924,7 @@ def main() -> int:
                     if len(candidates) == 1:
                         selected_run, previous = candidates[0]
                         with file_lock(selected_run / ".workflow-state.lock"):
-                            recover_report_publish(selected_run)
+                            recover_report_publish(selected_run, repair_legacy=True)
                             recover_legacy_migration(selected_run)
                             current = read_state(selected_run)
                             if current["version"] < 8:
@@ -1878,7 +1941,8 @@ def main() -> int:
                     parser.error("a new run needs --review-mode and this request's --mode-reference")
                 if not args.mode_reference.strip():
                     raise ValueError("a new run needs --review-mode and this request's --mode-reference")
-                state = {"version": 8, "policy_version": 1, "run_id": uuid.uuid4().hex,
+                state = {"version": 8, "policy_version": 2,
+                         "run_id": "v8p2-" + uuid.uuid4().hex,
                          "work_item": args.work_item, "repo_root": str(repo_root),
                          "repo_roots": {area: str(root) for area, root in selected.items()},
                          "checkout_ids": checkout_ids, "scope": args.scope,
@@ -1903,6 +1967,8 @@ def main() -> int:
                                       {"schema_version": 1, "status": "pending", "sources": []})
                     write_json_atomic(staging_dir / "scope-register.json",
                                       {"schema_version": 1, "questions": []})
+                    write_json_atomic(staging_dir / "run-policy.json",
+                                      run_policy_data(state["run_id"], state["policy_version"]))
                     os.replace(staging_dir, run_dir)
                 except Exception:
                     shutil.rmtree(staging_dir, ignore_errors=True)
@@ -1914,7 +1980,7 @@ def main() -> int:
         state = read_state(run_dir)
         lock_handle = (run_dir / ".workflow-state.lock").open("a+b")
         fcntl.flock(lock_handle, fcntl.LOCK_EX)
-        recover_report_publish(run_dir)
+        recover_report_publish(run_dir, repair_legacy=True)
         recover_legacy_migration(run_dir)
         state = read_state(run_dir)
         if args.command == "status":

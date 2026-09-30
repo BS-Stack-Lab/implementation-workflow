@@ -14,8 +14,10 @@ import uuid
 from pathlib import Path
 
 from orchestrate import choose_model, focus_for, focus_question
+from render_result import requires_test_code_assessment
 from workflow_harness import (acceptance_ids, ensure_local_run_dir, evidence_digest,
-                              lexical_absolute, read_state, repo_for_area, required_slots, review_depth)
+                              lexical_absolute, plans, read_state, repo_for_area,
+                              required_slots, review_depth)
 
 
 def changed_paths(repo: Path, base: str | None = None) -> list[str]:
@@ -213,7 +215,7 @@ def brief(run_dir: Path, stage: str, area: str, slot: int, source: str,
         item_base = base or state.get("base_commits", {}).get(item)
         paths = changed_paths(repo_for_area(state, item), item_base)
         changed.extend(f"{item}:{path}" for path in paths)
-    return {
+    result = {
         "stage": stage, "area": area, "slot": slot,
         "focus": focus_for(stage, area, slot, review_depth(state)),
         "question": focus_question(stage, area, slot, review_depth(state)),
@@ -235,6 +237,29 @@ def brief(run_dir: Path, stage: str, area: str, slot: int, source: str,
                                "rule": "If isolation is unsupported, record why and provide full context; keep distinct agents."}},
         "selection": choose_model(stage, slot, supported, default_model, default_effort),
     }
+    assessment_slot = 3 if review_depth(state) == "full" else 1
+    if (stage == "code-review" and requires_test_code_assessment(state, run_dir)
+            and slot == assessment_slot):
+        verification, _ = plans(run_dir, state)
+        result["test_code_assessment_schema"] = {
+            "required_fields": ["outcome", "rationale", "acceptance_criteria",
+                                "required_test_ids", "change_paths", "reviewed_test_paths",
+                                "test_path_evidence", "omission_category"],
+            "outcome": ["verified", "not-needed"],
+            "rationale": "non-empty string",
+            "acceptance_criteria": sorted(criteria[area]),
+            "required_test_ids": sorted(item["id"] for item in verification[area]
+                                         if item["kind"] == "test" and item["required"]),
+            "change_paths": [path for path in changed if path.startswith(area + ":")],
+            "verified": {"reviewed_test_paths": "non-empty unique subset of change_paths",
+                         "test_path_evidence": "one {path, location, test_behavior} per reviewed path; explain repo-specific or inline test locations",
+                         "omission_category": None},
+            "not-needed": {"reviewed_test_paths": [],
+                           "test_path_evidence": [],
+                           "omission_category": ["documentation-only", "formatting-only",
+                                                 "mechanical-rename", "low-risk-simple-change"]},
+        }
+    return result
 
 
 def main() -> int:

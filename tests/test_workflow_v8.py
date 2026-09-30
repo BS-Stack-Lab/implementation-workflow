@@ -79,7 +79,198 @@ class WorkflowHarnessV8Test(unittest.TestCase):
                            "--draft-file", str(draft))
         self.assertEqual(json.loads(result.stdout)["status"], "complete")
 
-    def test_required_decision_closes_unanswered_as_incomplete(self) -> None:
+    def test_pending_question_does_not_interrupt_earlier_workflow_stages(self) -> None:
+        self.set_sources_not_applicable()
+        self.call("scope-question", "--run-dir", str(self.run_dir), "--question-id", "optional-extra",
+                  "--kind", "scope_extension", "--question", "Add extra docs?",
+                  "--path", "docs/extra.md", "--impact", "Outside current request")
+        status = json.loads(self.call("status", "--run-dir", str(self.run_dir)).stdout)
+        self.assertNotEqual(status["next_action"], "answer-question")
+        self.assertFalse(status["complete"])
+
+    def test_legacy_interrupted_publish_reopens_pending_question(self) -> None:
+        self.set_sources_not_applicable()
+        self.add_design_and_plans()
+        self.call("scope-question", "--run-dir", str(self.run_dir), "--question-id", "old-question",
+                  "--kind", "scope_extension", "--question", "Add extra docs?",
+                  "--path", "docs/extra.md", "--impact", "Outside current request")
+        state = json.loads((self.run_dir / "state.json").read_text(encoding="utf-8"))
+        question = json.loads((self.run_dir / "scope-register.json").read_text(encoding="utf-8"))["questions"][0]
+        question.update({"status": "unanswered", "revision": 2})
+        question["question_digest"] = workflow_harness.scope_question_digest(state["run_id"], question)
+        state["events"].append({"type": "scope-answer", "run_id": state["run_id"],
+                                "question_id": question["id"], "status": "unanswered",
+                                "question_state": question,
+                                "reference": "report publication closed the pending question"})
+        state["events"].append({"type": "report-published", "run_id": state["run_id"],
+                                "status": "complete", "report_digest": "a" * 64})
+        staged = [workflow_harness.stage_transaction_file(
+            self.run_dir, "final-report.md", b"old interrupted report\n"),
+            workflow_harness.stage_transaction_file(
+                self.run_dir, "scope-register.json",
+                workflow_harness.serialized_json({"schema_version": 1, "questions": [question]})),
+            workflow_harness.stage_transaction_file(
+                self.run_dir, "state.json", workflow_harness.serialized_json(state))]
+        workflow_harness.write_json_atomic(
+            self.run_dir / ".report-publish.pending.json", {"schema_version": 1, "files": staged})
+        for item in staged:
+            os.replace(self.run_dir / item["temporary"], self.run_dir / item["target"])
+        self.call("status", "--run-dir", str(self.run_dir))
+        recovered_state = json.loads((self.run_dir / "state.json").read_text(encoding="utf-8"))
+        register = json.loads((self.run_dir / "scope-register.json").read_text(encoding="utf-8"))
+        self.assertEqual(register["questions"][0]["status"], "pending")
+        self.assertFalse(any(event.get("type") == "scope-answer" for event in recovered_state["events"]))
+        self.assertFalse(any(event.get("type") == "report-published" for event in recovered_state["events"]))
+        self.assertFalse((self.run_dir / "final-report.md").exists())
+        self.assertEqual(len(list(self.run_dir.glob("final-report-interrupted-*.md"))), 1)
+        self.assertFalse((self.run_dir / ".report-publish.pending.json").exists())
+
+    def test_completed_legacy_unanswered_report_without_journal_is_preserved(self) -> None:
+        self.set_sources_not_applicable()
+        self.call("scope-question", "--run-dir", str(self.run_dir), "--question-id", "historical-question",
+                  "--kind", "scope_extension", "--question", "Add extra docs?",
+                  "--path", "docs/extra.md", "--impact", "Outside current request")
+        state = json.loads((self.run_dir / "state.json").read_text(encoding="utf-8"))
+        question = json.loads((self.run_dir / "scope-register.json").read_text(encoding="utf-8"))["questions"][0]
+        question.update({"status": "unanswered", "revision": 2})
+        state["events"].append({"type": "scope-answer", "run_id": state["run_id"],
+                                "question_id": question["id"], "status": "unanswered",
+                                "question_state": question,
+                                "reference": "report publication closed the pending question"})
+        state["events"].append({"type": "report-published", "run_id": state["run_id"],
+                                "status": "complete", "report_digest": "a" * 64})
+        (self.run_dir / "state.json").write_bytes(workflow_harness.serialized_json(state))
+        (self.run_dir / "scope-register.json").write_text(json.dumps(
+            {"schema_version": 1, "questions": [question]}), encoding="utf-8")
+        report = self.run_dir / "final-report.md"
+        report.write_text("Historical completed report\n", encoding="utf-8")
+        self.call("status", "--run-dir", str(self.run_dir))
+        self.assertEqual((self.run_dir / "state.json").read_bytes(), workflow_harness.serialized_json(state))
+        self.assertEqual(report.read_text(encoding="utf-8"), "Historical completed report\n")
+        self.assertFalse(list(self.run_dir.glob("final-report-interrupted-*.md")))
+
+    def test_new_publish_after_legacy_incomplete_answer_is_not_repaired_as_legacy(self) -> None:
+        self.set_sources_not_applicable()
+        self.add_design_and_plans()
+        self.call("scope-question", "--run-dir", str(self.run_dir), "--question-id", "old-decision",
+                  "--kind", "required_decision", "--question", "Which contract?",
+                  "--dependent-path", "src/api.py", "--impact", "Implementation depends on this")
+        state = json.loads((self.run_dir / "state.json").read_text(encoding="utf-8"))
+        question = json.loads((self.run_dir / "scope-register.json").read_text(encoding="utf-8"))["questions"][0]
+        question.update({"status": "unanswered", "revision": 2})
+        question["question_digest"] = workflow_harness.scope_question_digest(state["run_id"], question)
+        workflow_harness.write_json_atomic(self.run_dir / "scope-register.json",
+                                           {"schema_version": 1, "questions": [question]})
+        previous_report = "Earlier incomplete report\n"
+        (self.run_dir / "final-report.md").write_text(previous_report, encoding="utf-8")
+        binding = dict(workflow_harness.current_binding(self.run_dir, state))
+        binding["questions"] = workflow_harness.hashlib.sha256(
+            (self.run_dir / "scope-register.json").read_bytes()).hexdigest()
+        state["events"].append({"type": "scope-answer", "run_id": state["run_id"],
+                                "question_id": question["id"], "status": "unanswered",
+                                "question_state": question,
+                                "reference": "report publication closed the pending question"})
+        state["events"].append({"type": "report-published", "run_id": state["run_id"],
+                                "status": "incomplete", "binding": binding,
+                                "report_digest": workflow_harness.hashlib.sha256(
+                                    previous_report.encode()).hexdigest()})
+        workflow_harness.write_state(self.run_dir, state)
+        self.call("scope-answer", "--run-dir", str(self.run_dir), "--question-id", question["id"],
+                  "--run-id", state["run_id"], "--revision", str(question["revision"]),
+                  "--question-digest", question["question_digest"], "--status", "approved",
+                  "--answer", "Use current contract", "--reference", "user approval")
+        draft = self.run_dir / "report-draft.md"
+        draft.write_text("## 변경 파일 및 코드 위치\n변경 없음\n\n## 동작 원리\n기존 계약을 사용\n\n"
+                         "## 검증 결과\n요청 범위 결과를 기록\n\n## 요청 밖 문제 및 질문\n없음\n",
+                         encoding="utf-8")
+        result = self.call("report-publish", "--run-dir", str(self.run_dir),
+                           "--draft-file", str(draft))
+        self.assertEqual(json.loads(result.stdout)["status"], "complete")
+        self.assertTrue((self.run_dir / "final-report.md").is_file())
+        self.assertFalse(list(self.run_dir.glob("final-report-interrupted-*.md")))
+        state = json.loads((self.run_dir / "state.json").read_text(encoding="utf-8"))
+        self.assertEqual(state["events"][-1]["type"], "report-published")
+        self.assertEqual(state["events"][-1]["status"], "complete")
+
+    def test_legacy_recovery_does_not_reopen_historical_closure_before_new_publish(self) -> None:
+        self.set_sources_not_applicable()
+        self.call("scope-question", "--run-dir", str(self.run_dir), "--question-id", "old-decision",
+                  "--kind", "required_decision", "--question", "Which contract?",
+                  "--dependent-path", "src/api.py", "--impact", "Implementation depends on this")
+        state = json.loads((self.run_dir / "state.json").read_text(encoding="utf-8"))
+        question = json.loads((self.run_dir / "scope-register.json").read_text(encoding="utf-8"))["questions"][0]
+        self.call("scope-answer", "--run-dir", str(self.run_dir), "--question-id", question["id"],
+                  "--run-id", state["run_id"], "--revision", str(question["revision"]),
+                  "--question-digest", question["question_digest"], "--status", "approved",
+                  "--answer", "Use current contract", "--reference", "user approval")
+
+        state = json.loads((self.run_dir / "state.json").read_text(encoding="utf-8"))
+        approved_event = state["events"].pop()
+        unanswered = dict(question, status="unanswered", revision=2)
+        unanswered["question_digest"] = workflow_harness.scope_question_digest(
+            state["run_id"], unanswered)
+        state["events"].extend([
+            {"type": "scope-answer", "run_id": state["run_id"],
+             "question_id": question["id"], "status": "unanswered",
+             "question_state": unanswered,
+             "reference": "report publication closed the pending question"},
+            {"type": "report-published", "run_id": state["run_id"],
+             "status": "incomplete", "report_digest": "a" * 64},
+            approved_event])
+        latest_report = "Current report after user approval\n"
+        state["events"].append({"type": "report-published", "run_id": state["run_id"],
+                                "status": "complete", "report_digest": workflow_harness.hashlib.sha256(
+                                    latest_report.encode()).hexdigest()})
+        staged = [workflow_harness.stage_transaction_file(
+            self.run_dir, "final-report.md", latest_report.encode()),
+            workflow_harness.stage_transaction_file(
+            self.run_dir, "scope-register.json",
+                workflow_harness.serialized_json(json.loads(
+                    (self.run_dir / "scope-register.json").read_text(encoding="utf-8")))),
+            workflow_harness.stage_transaction_file(
+                self.run_dir, "state.json", workflow_harness.serialized_json(state))]
+        workflow_harness.write_json_atomic(
+            self.run_dir / ".report-publish.pending.json", {"schema_version": 1, "files": staged})
+        for item in staged:
+            os.replace(self.run_dir / item["temporary"], self.run_dir / item["target"])
+
+        self.call("status", "--run-dir", str(self.run_dir))
+
+        recovered = json.loads((self.run_dir / "state.json").read_text(encoding="utf-8"))
+        self.assertEqual(recovered["events"][-1]["type"], "report-published")
+        self.assertEqual(recovered["events"][-1]["status"], "complete")
+        self.assertEqual((self.run_dir / "final-report.md").read_text(encoding="utf-8"), latest_report)
+        self.assertFalse(list(self.run_dir.glob("final-report-interrupted-*.md")))
+        self.assertFalse((self.run_dir / ".report-publish-recovery.pending.json").exists())
+
+    def test_legacy_recovery_retry_rebuilds_register_after_partial_repair(self) -> None:
+        self.set_sources_not_applicable()
+        self.call("scope-question", "--run-dir", str(self.run_dir), "--question-id", "retry-question",
+                  "--kind", "scope_extension", "--question", "Add extra docs?",
+                  "--path", "docs/extra.md", "--impact", "Outside current request")
+        state = json.loads((self.run_dir / "state.json").read_text(encoding="utf-8"))
+        pending = json.loads((self.run_dir / "scope-register.json").read_text(encoding="utf-8"))["questions"][0]
+        closed = dict(pending, status="unanswered", revision=2)
+        closed["question_digest"] = workflow_harness.scope_question_digest(state["run_id"], closed)
+        state["events"].append({"type": "scope-answer", "run_id": state["run_id"],
+                                "question_id": pending["id"], "status": "unanswered",
+                                "question_state": closed,
+                                "reference": "report publication closed the pending question"})
+        state["events"].pop()
+        workflow_harness.write_state(self.run_dir, state)
+        (self.run_dir / "scope-register.json").write_text(json.dumps(
+            {"schema_version": 1, "questions": [closed]}), encoding="utf-8")
+        (self.run_dir / "final-report.md").write_text("interrupted report\n", encoding="utf-8")
+        os.replace(self.run_dir / "final-report.md",
+                   self.run_dir / "final-report-interrupted-existing.md")
+        workflow_harness.write_json_atomic(
+            self.run_dir / ".report-publish-recovery.pending.json", {"schema_version": 1})
+        workflow_harness.recover_report_publish(self.run_dir, repair_legacy=True)
+        self.assertFalse((self.run_dir / ".report-publish-recovery.pending.json").exists())
+        recovered = json.loads((self.run_dir / "scope-register.json").read_text(encoding="utf-8"))
+        self.assertEqual(recovered["questions"][0]["status"], "pending")
+
+    def test_required_decision_must_be_explicitly_closed_before_publish(self) -> None:
         self.set_sources_not_applicable()
         self.add_design_and_plans()
         self.call("scope-question", "--run-dir", str(self.run_dir), "--question-id", "api-contract",
@@ -89,18 +280,19 @@ class WorkflowHarnessV8Test(unittest.TestCase):
         draft.write_text("## 변경 파일 및 코드 위치\n변경 없음\n\n## 동작 원리\n미결정 항목은 보류\n\n"
                          "## 검증 결과\n요청 범위 검증 결과를 기록\n\n"
                          "## 요청 밖 문제 및 질문\n필수 결정을 질문함\n", encoding="utf-8")
-        result = self.call("report-publish", "--run-dir", str(self.run_dir),
-                           "--draft-file", str(draft))
-        self.assertEqual(json.loads(result.stdout)["status"], "incomplete")
-        report = (self.run_dir / "final-report.md").read_text(encoding="utf-8")
-        self.assertIn("unanswered", report)
+        original_state = (self.run_dir / "state.json").read_bytes()
+        original_register = (self.run_dir / "scope-register.json").read_bytes()
+        self.call("report-publish", "--run-dir", str(self.run_dir),
+                  "--draft-file", str(draft), expected=1)
+        self.assertEqual((self.run_dir / "state.json").read_bytes(), original_state)
+        self.assertEqual((self.run_dir / "scope-register.json").read_bytes(), original_register)
+        self.assertFalse((self.run_dir / "final-report.md").exists())
         state = json.loads((self.run_dir / "state.json").read_text(encoding="utf-8"))
         question_events = [event for event in state["events"] if event.get("type") == "scope-question"]
         answer_events = [event for event in state["events"] if event.get("type") == "scope-answer"]
         self.assertEqual(question_events[-1]["question_state"]["status"], "pending")
-        self.assertEqual(answer_events[-1]["question_state"]["status"], "unanswered")
+        self.assertEqual(answer_events, [])
         self.assertFalse(any(event.get("type") == "final-gate-passed" for event in state["events"]))
-        previous_plans = workflow_harness.plan_digests(self.run_dir, state)
         question = json.loads((self.run_dir / "scope-register.json").read_text(encoding="utf-8"))["questions"][0]
         answer_prefix = ("scope-answer", "--run-dir", str(self.run_dir), "--question-id", "api-contract",
                          "--run-id", state["run_id"])
@@ -108,6 +300,13 @@ class WorkflowHarnessV8Test(unittest.TestCase):
                             "--question-digest", question["question_digest"], "--status", "declined",
                             "--answer", "Need more time", "--reference", "user deferred")
         self.assertEqual(json.loads(decline.stdout)["status"], "declined")
+        result = self.call("report-publish", "--run-dir", str(self.run_dir),
+                           "--draft-file", str(draft))
+        self.assertEqual(json.loads(result.stdout)["status"], "incomplete")
+        report = (self.run_dir / "final-report.md").read_text(encoding="utf-8")
+        self.assertIn("declined", report)
+        previous_plans = workflow_harness.plan_digests(
+            self.run_dir, json.loads((self.run_dir / "state.json").read_text(encoding="utf-8")))
         self.call("report-publish", "--run-dir", str(self.run_dir), "--draft-file", str(draft))
         question = json.loads((self.run_dir / "scope-register.json").read_text(encoding="utf-8"))["questions"][0]
         approve = self.call(*answer_prefix, "--revision", str(question["revision"]),
@@ -117,7 +316,7 @@ class WorkflowHarnessV8Test(unittest.TestCase):
         revised = json.loads((self.run_dir / "state.json").read_text(encoding="utf-8"))
         answer_events = [event for event in revised["events"] if event.get("type") == "scope-answer"]
         self.assertEqual([event["question_state"]["status"] for event in answer_events],
-                         ["unanswered", "declined", "approved"])
+                         ["declined", "approved"])
         self.assertNotEqual(previous_plans["approved-scope"],
                             workflow_harness.plan_digests(self.run_dir, revised)["approved-scope"])
         self.assertFalse(workflow_harness.has_current_incomplete_report(
@@ -420,6 +619,9 @@ class WorkflowHarnessV8Test(unittest.TestCase):
         self.assertTrue((self.run_dir / "state.json").is_file())
         self.assertTrue((self.run_dir / "official-sources.json").is_file())
         self.assertTrue((self.run_dir / "scope-register.json").is_file())
+        policy = json.loads((self.run_dir / "run-policy.json").read_text(encoding="utf-8"))
+        state = json.loads((self.run_dir / "state.json").read_text(encoding="utf-8"))
+        self.assertEqual(policy, workflow_harness.run_policy_data(state["run_id"], 2))
         self.assertFalse(any(self.run_dir.parent.glob(".workflow-init-*")))
 
     def test_exact_resume_promotes_incomplete_legacy_run_with_snapshot(self) -> None:
