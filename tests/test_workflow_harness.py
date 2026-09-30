@@ -43,11 +43,15 @@ class WorkflowHarnessTest(unittest.TestCase):
     def init(self, scope: str, review_mode: str = "immediate") -> None:
         self.call("init", "--repo", str(self.repo), "--scope", scope,
                   "--review-mode", review_mode, "--mode-reference", "user answered for this request",
+                  "--risk-level", "low", "--risk-reason", "legacy fixture",
                   "--run-dir", str(self.run_dir))
         # These fixtures exercise already-created v3 runs after a v4 upgrade.
         state_file = self.run_dir / "state.json"
         state = json.loads(state_file.read_text(encoding="utf-8"))
         state["version"] = 3
+        state["policy_version"] = 1
+        state.pop("risk_level", None)
+        state.pop("risk_reason", None)
         state_file.write_text(json.dumps(state), encoding="utf-8")
 
     def write(self, name: str, content: str = "evidence\n") -> None:
@@ -278,10 +282,14 @@ class WorkflowHarnessTest(unittest.TestCase):
         (empty_repo / "new.py").write_text("value = 1\n", encoding="utf-8")
         self.call("init", "--repo", str(empty_repo), "--scope", "frontend",
                   "--review-mode", "immediate", "--mode-reference", "user answered",
+                  "--risk-level", "low", "--risk-reason", "unborn legacy fixture",
                   "--run-dir", str(self.run_dir))
         state_file = self.run_dir / "state.json"
         state = json.loads(state_file.read_text(encoding="utf-8"))
         state["version"] = 3
+        state["policy_version"] = 1
+        state.pop("risk_level", None)
+        state.pop("risk_reason", None)
         state_file.write_text(json.dumps(state), encoding="utf-8")
         self.write("frontend-design.md")
         self.check_record("frontend")

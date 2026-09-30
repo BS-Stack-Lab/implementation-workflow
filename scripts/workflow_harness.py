@@ -8,11 +8,14 @@ import fcntl
 import hashlib
 import json
 import os
+import platform
 import re
 import shutil
 import subprocess
+import statistics
 import sys
 import tempfile
+import time
 import uuid
 from contextlib import contextmanager
 from datetime import datetime, timezone
@@ -53,14 +56,69 @@ def review_areas(scope: str) -> list[str]:
 
 
 def required_slots(state: dict) -> tuple[int, ...]:
-    return (1,) if state.get("version", 0) >= 6 and state.get("review_depth") == "light" else REVIEW_SLOTS
+    return ((1,) if state.get("version", 0) >= 6
+            and state.get("review_depth") in {"light", "balanced"} else REVIEW_SLOTS)
 
 
 def review_depth(state: dict) -> str:
     return state.get("review_depth", "full") if state.get("version", 0) >= 6 else "full"
 
 
-def risk_guard(state: dict) -> None:
+def scenario_slot(scenario: dict, state: dict) -> int:
+    if state.get("policy_version", 1) >= 3 and review_depth(state) == "balanced":
+        return scenario.get("balanced_slot", 0)
+    return scenario["slot"]
+
+
+def risk_guard(state: dict, run_dir: Path | None = None) -> None:
+    if any(event.get("type") == "run-superseded" for event in state.get("events", [])):
+        raise ValueError("this run was superseded; continue in its linked full run")
+    if state.get("policy_version", 1) >= 3:
+        risk = state.get("risk_level")
+        depth = review_depth(state)
+        if risk not in {"low", "medium", "high", "unknown"}:
+            raise ValueError("policy v3 run needs an explicit risk level")
+        if not str(state.get("risk_reason", "")).strip():
+            raise ValueError("policy v3 run needs risk evidence")
+        if depth == "light" and (state["scope"] == "both" or risk != "low"):
+            raise ValueError("light review needs a low-risk single-area run")
+        if depth == "balanced" and (state["scope"] != "both" or risk not in {"low", "medium"}):
+            raise ValueError("balanced review needs a low/medium two-area run")
+        if depth not in {"light", "balanced", "full"}:
+            raise ValueError("unsupported policy v3 review profile")
+        assessments = []
+        for event in state.get("events", []):
+            if event.get("type") not in {"review", "code-review"}:
+                continue
+            if run_dir is not None:
+                current_digest = (design_digest(run_dir, event["area"])
+                                  if event["type"] == "review"
+                                  else code_digest_for(run_dir, state, event["area"]))
+                if event.get("digest") != current_digest \
+                        or event.get("plans") != plan_digests(run_dir, state):
+                    continue
+            assessments.append(event.get("risk_level", "unknown"))
+        if any(item not in {"low", "medium", "high", "unknown"} for item in assessments):
+            raise ValueError("policy v3 design reviews need an explicit risk assessment")
+        assessed_risks = [risk, *assessments]
+        if depth == "light" and any(item != "low" for item in assessed_risks):
+            raise ValueError("effective medium/high/unknown risk requires a new full run with fresh evidence")
+        if depth == "balanced" and any(item in {"high", "unknown"} for item in assessed_risks):
+            raise ValueError("reviewer risk requires a new full run with fresh evidence")
+        if depth == "balanced":
+            for area in areas_for(state["scope"]):
+                repo = repo_for_area(state, area)
+                base = state.get("base_commits", {}).get(area)
+                changed = git_output(repo, "diff", "--name-only", "--no-renames", base or "HEAD", "-z", "--")
+                untracked = git_output(repo, "ls-files", "--others", "--exclude-standard", "-z")
+                paths = set((changed + untracked).split(b"\0")) - {b""}
+                for raw in paths:
+                    path = os.fsdecode(raw).casefold()
+                    parts = set(re.split(r"[/_.-]+", path))
+                    if parts & RISK_SEGMENTS or Path(path).name in ROOT_SHARED_FILES \
+                            or any(part in SHARED_SEGMENTS for part in path.split("/")[:-1]) \
+                            or path.split("/")[0] in {"deploy", "infra", ".github"}:
+                        raise ValueError(f"balanced review cannot include a high-risk or shared path: {path}")
     if review_depth(state) != "light":
         return
     if state["scope"] == "both" or not str(state.get("risk_reason", "")).strip():
@@ -93,8 +151,10 @@ def risk_guard(state: dict) -> None:
     for raw in changed_paths:
         path = os.fsdecode(raw).casefold()
         parts = set(re.split(r"[/_.-]+", path))
-        if parts & RISK_SEGMENTS or Path(path).name in ROOT_SHARED_FILES:
-            raise ValueError(f"light review cannot include a high-risk path: {path}")
+        if parts & RISK_SEGMENTS or default_shared(path) \
+                or any(part in SHARED_SEGMENTS for part in path.split("/")[:-1]) \
+                or path.split("/")[0] in {"deploy", "infra", ".github"}:
+            raise ValueError(f"light review cannot include a high-risk path or shared path: {path}")
 
 
 def within(path: Path, parent: Path) -> bool:
@@ -133,6 +193,12 @@ def file_lock(path: Path):
             yield
         finally:
             fcntl.flock(handle, fcntl.LOCK_UN)
+
+
+def recover_run_transactions(run_dir: Path) -> None:
+    parent = lexical_absolute(run_dir).parent
+    with file_lock(parent / ".workflow-init.lock"):
+        recover_supersede_transactions(parent)
 
 
 def docs_base() -> Path:
@@ -199,8 +265,18 @@ def read_state(run_dir: Path) -> dict:
         ensure_local_run_dir(run_dir, repo, allow_legacy=True)
         if state["version"] >= 7 and checkout_identity(repo) != state["checkout_ids"][area]:
             raise ValueError(f"Git checkout changed for {area}")
-    if state["version"] >= 6 and state.get("review_depth") not in {"light", "full"}:
+    allowed_depths = {"light", "full"}
+    if state.get("policy_version", 1) >= 3:
+        allowed_depths.add("balanced")
+    if state["version"] >= 6 and state.get("review_depth") not in allowed_depths:
         raise ValueError("v6 run needs a review depth")
+    policy_version = state.get("policy_version", 1)
+    if type(policy_version) is not int or policy_version not in {1, 2, 3}:
+        raise ValueError("unsupported workflow policy version")
+    if policy_version >= 2 and not str(state.get("run_id", "")).startswith(f"v8p{policy_version}-"):
+        raise ValueError("workflow run ID does not match its policy version")
+    if policy_version < 3 and state.get("review_depth") == "balanced":
+        raise ValueError("balanced profile is unavailable before policy v3")
     return state
 
 
@@ -248,7 +324,8 @@ def evidence_digest(run_dir: Path, raw_path: str) -> tuple[str, str]:
 
 
 def result_binding(run_dir: Path, raw_path: str, stage: str, area: str, slot: int,
-                   agent_id: str, focus: str, result: str) -> dict:
+                   agent_id: str, focus: str, result: str,
+                   risk_level: str | None = None) -> dict:
     from render_result import markdown, validate
 
     data, path, digest = validate(run_dir, raw_path)
@@ -256,6 +333,8 @@ def result_binding(run_dir: Path, raw_path: str, stage: str, area: str, slot: in
                 "focus": focus, "result": result}
     if any(data.get(key) != value for key, value in expected.items()):
         raise ValueError("JSON result conflicts with the recorded agent outcome")
+    if risk_level is not None and data.get("risk_level") != risk_level:
+        raise ValueError("JSON risk assessment conflicts with the recorded design review")
     artifact = agent_artifact(stage, area, slot)
     require_artifact(run_dir, artifact)
     if (run_dir / artifact).read_text(encoding="utf-8") != markdown(data):
@@ -285,7 +364,7 @@ def verify_result_binding(run_dir: Path, event: dict) -> None:
     stage = "design-review" if event["type"] == "review" else event["type"]
     actual = result_binding(run_dir, str(run_dir / event["result_json"]), stage,
                             event["area"], event["slot"], event["agent_id"],
-                            event["focus"], event["result"])
+                            event["focus"], event["result"], event.get("risk_level"))
     if actual != {"result_json": event["result_json"],
                    "result_json_digest": event["result_json_digest"]}:
         raise ValueError("structured result changed after recording")
@@ -450,7 +529,18 @@ def plans(run_dir: Path, state: dict) -> tuple[dict, dict]:
         scope_register(run_dir, state)
     checks = json.loads((run_dir / "verification-plan.json").read_text(encoding="utf-8"))
     cases = json.loads((run_dir / "qa-plan.json").read_text(encoding="utf-8"))
-    impact_map(run_dir, state)
+    ownership = impact_map(run_dir, state)
+    if state.get("policy_version", 1) >= 3 and state["scope"] == "both":
+        if ownership is None:
+            raise ValueError("policy v3 both-area run needs impact-map.json")
+        exclusive = ownership["exclusive_paths"]
+        if not exclusive["frontend"] or not exclusive["backend"]:
+            raise ValueError("parallel ownership map needs exact paths for both areas")
+        if ownership["shared"] or exclusive["shared"]:
+            raise ValueError("shared changes need a separate single-area full run in the repository "
+                             "that owns them; complete its code review and QA before starting the "
+                             "frontend/backend run against that reviewed contract. Commit the reviewed "
+                             "contract locally first so it is part of the new run baseline; do not push")
     allowed = set(review_areas(state["scope"]))
     if not isinstance(checks, dict) or not isinstance(cases, dict) or set(checks) != allowed or set(cases) != allowed:
         raise ValueError("plans must contain exactly the active areas")
@@ -479,7 +569,7 @@ def plans(run_dir: Path, state: dict) -> tuple[dict, dict]:
         covered = set()
         slots = set()
         for scenario in scenarios:
-            if not isinstance(scenario, dict) or scenario.get("slot") not in expected_slots \
+            if not isinstance(scenario, dict) or scenario.get("slot") not in REVIEW_SLOTS \
                     or not isinstance(scenario.get("scenario_id"), str) or not scenario["scenario_id"].strip() \
                     or scenario["scenario_id"] in scenario_ids \
                     or not isinstance(scenario.get("criterion_id"), str) \
@@ -492,8 +582,14 @@ def plans(run_dir: Path, state: dict) -> tuple[dict, dict]:
             if source_area not in criteria or scenario["criterion_id"] not in criteria[source_area] \
                     or (area != "integration" and source_area != area):
                 raise ValueError(f"QA scenario references an undeclared criterion: {area}")
+            if state.get("policy_version", 1) >= 3 and review_depth(state) == "balanced":
+                if scenario.get("balanced_slot") != 1:
+                    raise ValueError(f"v3 QA scenario needs balanced_slot 1: {area}")
+            planned_slot = scenario_slot(scenario, state)
+            if planned_slot not in expected_slots:
+                raise ValueError(f"QA scenario slot is outside the review profile: {area}")
             scenario_ids.add(scenario["scenario_id"])
-            slots.add(scenario["slot"])
+            slots.add(planned_slot)
             if area != "integration":
                 covered.add(scenario["criterion_id"])
         if slots != expected_slots:
@@ -502,6 +598,28 @@ def plans(run_dir: Path, state: dict) -> tuple[dict, dict]:
             raise ValueError(f"v6 QA plan needs all five scenario kinds: {area}")
         if area != "integration" and covered != criteria[area]:
             raise ValueError(f"QA plan does not cover every criterion: {area}")
+    baseline = state.get("required_plan_baseline")
+    if baseline:
+        if not isinstance(baseline, dict) or baseline.get("schema_version") != 1:
+            raise ValueError("invalid inherited plan baseline")
+        for area, old_entries in baseline.get("verification", {}).items():
+            if area not in checks:
+                raise ValueError(f"inherited verification area is missing: {area}")
+            current_by_id = {entry["id"]: entry for entry in checks[area]}
+            for entry in old_entries:
+                if current_by_id.get(entry.get("id")) != entry:
+                    raise ValueError(f"inherited check was removed or weakened: {area} {entry.get('id')}")
+        for area, old_cases in baseline.get("qa", {}).items():
+            if area not in cases:
+                raise ValueError(f"inherited QA area is missing: {area}")
+            current_by_id = {entry["scenario_id"]: entry for entry in cases[area]}
+            for entry in old_cases:
+                if current_by_id.get(entry.get("scenario_id")) != entry:
+                    raise ValueError(f"inherited QA scenario was removed or weakened: {area} "
+                                     f"{entry.get('scenario_id')}")
+        for area, old_criteria in baseline.get("criteria", {}).items():
+            if area not in criteria or not set(old_criteria) <= criteria[area]:
+                raise ValueError(f"inherited acceptance criteria were removed: {area}")
     return checks, cases
 
 
@@ -512,6 +630,10 @@ def plan_digests(run_dir: Path, state: dict | None = None) -> dict[str, str]:
     if state is not None and state.get("version", 0) >= 8:
         names.append("official-sources.json")
     digests = {name: artifact_digest(run_dir, name) for name in names}
+    if state is not None and state.get("required_plan_baseline"):
+        payload = json.dumps(state["required_plan_baseline"], sort_keys=True,
+                             ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+        digests["inherited-plan-baseline"] = hashlib.sha256(payload).hexdigest()
     if state is not None and state.get("version", 0) >= 8:
         register = scope_register_data(state)
         approved = [{key: question.get(key) for key in
@@ -520,6 +642,203 @@ def plan_digests(run_dir: Path, state: dict | None = None) -> dict[str, str]:
         digests["approved-scope"] = hashlib.sha256(json.dumps(
             approved, sort_keys=True, ensure_ascii=False, separators=(",", ":")).encode("utf-8")).hexdigest()
     return digests
+
+
+def monotonic_session_id() -> str:
+    boot_id = Path("/proc/sys/kernel/random/boot_id")
+    if boot_id.is_file():
+        return platform.node() + ":" + boot_id.read_text(encoding="utf-8").strip()
+    if platform.system() == "Darwin":
+        result = subprocess.run(["sysctl", "-n", "kern.boottime"], capture_output=True, text=True)
+        if result.returncode == 0 and result.stdout.strip():
+            return platform.node() + ":" + result.stdout.strip()
+    boot_epoch = int(time.time() - time.monotonic())
+    return platform.node() + ":" + str(boot_epoch)
+
+
+def timing_code_binding(run_dir: Path, state: dict) -> dict[str, str]:
+    return {area: code_digest_for(run_dir, state, area) for area in areas_for(state["scope"])}
+
+
+def timing_event(state: dict, event_id: str) -> dict | None:
+    return next((event for event in state["events"]
+                 if event.get("type") == "timing-start" and event.get("event_id") == event_id), None)
+
+
+def timing_summary_data(state: dict, run_dir: Path | None = None) -> dict:
+    starts = {event.get("attempt_id"): event for event in state["events"]
+              if event.get("type") == "timing-start"}
+    finished = {}
+    for event in state["events"]:
+        if event.get("type") == "timing-finish":
+            start = starts.get(event.get("attempt_id"))
+            if start and event.get("start_event_id") == start.get("event_id") \
+                    and event.get("session_id") == start.get("session_id") \
+                    and event.get("plan_digests") == start.get("plan_digests"):
+                finished[event["attempt_id"]] = (start, event)
+    attempts = []
+    by_wave = {}
+    for attempt_id, (start, finish) in finished.items():
+        duration_ns = finish["finished_monotonic_ns"] - start["started_monotonic_ns"]
+        if duration_ns < 0:
+            continue
+        row = {"attempt_id": attempt_id, "task_id": start["task_id"],
+               "wave_id": start["wave_id"],
+               "wave_execution_id": start.get("wave_execution_id"),
+               "fixture_id": start.get("fixture_id"),
+               "environment_id": start.get("environment_id"),
+               "started_at": start.get("started_at"),
+               "finished_at": finish.get("finished_at"),
+               "duration_ms": duration_ns / 1_000_000,
+               "session_id": start["session_id"], "plan_digests": start["plan_digests"],
+               "start_code_binding": start["code_binding"],
+               "finish_code_binding": finish["code_binding"],
+               "log_digest": finish.get("log_digest")}
+        attempts.append(row)
+        code_binding = json.dumps(start.get("code_binding", {}), sort_keys=True)
+        group = (start["wave_id"], start.get("wave_execution_id"),
+                 start.get("fixture_id", "unknown"), start.get("environment_id", "unknown"),
+                 json.dumps(start["plan_digests"], sort_keys=True), start["session_id"], code_binding)
+        wave = by_wave.setdefault(group, [])
+        wave.append((start["started_monotonic_ns"], finish["finished_monotonic_ns"],
+                     start["session_id"]))
+    waves = []
+    for group, entries in sorted(by_wave.items()):
+        wave_id, execution_id, fixture_id, environment_id, plan_digest, _, code_binding = group
+        sessions = {entry[2] for entry in entries}
+        if len(sessions) != 1:
+            waves.append({"wave_id": wave_id, "duration_ms": None,
+                          "wave_execution_id": execution_id,
+                          "fixture_id": fixture_id, "environment_id": environment_id,
+                          "start_code_binding_digest": hashlib.sha256(code_binding.encode()).hexdigest(),
+                          "reason": "attempts do not share one monotonic clock session"})
+            continue
+        waves.append({"wave_id": wave_id,
+                      "wave_execution_id": execution_id,
+                      "fixture_id": fixture_id, "environment_id": environment_id,
+                      "plan_digest": hashlib.sha256(plan_digest.encode()).hexdigest(),
+                      "start_code_binding_digest": hashlib.sha256(code_binding.encode()).hexdigest(),
+                      "duration_ms": (max(entry[1] for entry in entries)
+                                      - min(entry[0] for entry in entries)) / 1_000_000,
+                      "attempt_count": len(entries), "session_id": next(iter(sessions))})
+    summary = {"schema_version": 1, "run_id": state["run_id"],
+               "completed_attempts": attempts, "waves": waves,
+               "unmatched_starts": sorted(set(starts) - set(finished)),
+               "improvement_status": "unverified",
+               "improvement_reason": "no matched pre-change baseline and quality comparison was supplied"}
+    if run_dir is not None:
+        summary["quality"] = timing_quality_snapshot(run_dir, state)
+    return summary
+
+
+def timing_quality_snapshot(run_dir: Path, state: dict) -> dict:
+    if not completed_run(run_dir, state):
+        return {"status": "incomplete", "reason": "run has not passed its current final gate"}
+    checks, cases = plans(run_dir, state)
+    digest_names = {"verification-plan.json", "qa-plan.json", "impact-map.json",
+                    "inherited-plan-baseline", "approved-scope"}
+    plan_contract = {name: digest for name, digest in plan_digests(run_dir, state).items()
+                     if name in digest_names}
+    evidence = [{key: event.get(key) for key in
+                 ("type", "area", "slot", "result", "digest", "design_digest", "plans",
+                  "artifact_digest", "evidence_digest", "case_digest", "case_artifact_digest")
+                 if key in event}
+                for event in state["events"]
+                if event.get("type") in {"check", "qa-case", "review", "code-review", "qa"}]
+    evidence_payload = json.dumps({"binding": current_binding(run_dir, state), "events": evidence},
+                                  sort_keys=True, ensure_ascii=False, separators=(",", ":"))
+    return {"status": "pass", "scope": state["scope"],
+            "review_mode": state.get("review_mode"),
+            "review_depth": review_depth(state), "policy_version": state.get("policy_version", 1),
+            "work_item": state.get("work_item"),
+            "repo_roots": state.get("repo_roots", {area: state["repo_root"]
+                                                        for area in review_areas(state["scope"])}),
+            "checkout_ids": state.get("checkout_ids", {}),
+            "plan_contract": plan_contract,
+            "required_check_count": sum(sum(1 for check in entries if check["required"])
+                                         for entries in checks.values()),
+            "qa_scenario_count": sum(len(entries) for entries in cases.values()),
+            "review_slots": list(required_slots(state)),
+            "evidence_digest": hashlib.sha256(evidence_payload.encode("utf-8")).hexdigest()}
+
+
+def compare_timing_summaries(baseline: dict, candidate: dict, minimum_samples: int = 3) -> dict:
+    before_quality = baseline.get("quality", {})
+    after_quality = candidate.get("quality", {})
+    quality_keys = ("status", "scope", "review_mode", "review_depth", "policy_version", "work_item",
+                    "repo_roots", "checkout_ids", "plan_contract", "required_check_count",
+                    "qa_scenario_count", "review_slots")
+    if before_quality.get("status") != "pass" or after_quality.get("status") != "pass":
+        return {"improvement_status": "unverified",
+                "reason": "both baseline and candidate must pass their current final gates",
+                "comparisons": []}
+    if any(before_quality.get(key) != after_quality.get(key) for key in quality_keys):
+        return {"improvement_status": "unverified",
+                "reason": "baseline and candidate do not have identical scope, review profile, "
+                          "checkout, required checks, and QA plan",
+                "comparisons": []}
+
+    def grouped(summary: dict) -> dict[tuple, list[dict]]:
+        result: dict[tuple, list[dict]] = {}
+        for attempt in summary.get("completed_attempts", []):
+            plan_contract = {name: digest for name, digest in attempt.get("plan_digests", {}).items()
+                             if name in {"verification-plan.json", "qa-plan.json", "impact-map.json",
+                                         "inherited-plan-baseline", "approved-scope"}}
+            key = (attempt.get("task_id"), attempt.get("wave_id"), attempt.get("fixture_id"),
+                   attempt.get("environment_id"), json.dumps(plan_contract, sort_keys=True))
+            result.setdefault(key, []).append(attempt)
+        return result
+
+    before = grouped(baseline)
+    after = grouped(candidate)
+    if set(before) != set(after):
+        return {"improvement_status": "unverified",
+                "reason": "baseline and candidate do not contain the same task/wave/fixture/"
+                          "environment/plan measurement groups",
+                "quality_status": "equivalent", "comparisons": []}
+    comparisons = []
+    incomplete_groups = []
+    for key in sorted(set(before) & set(after), key=str):
+        left, right = before[key], after[key]
+        left_bindings = {json.dumps(item.get("start_code_binding", {}), sort_keys=True) for item in left}
+        right_bindings = {json.dumps(item.get("start_code_binding", {}), sort_keys=True) for item in right}
+        if len(left) < minimum_samples or len(right) < minimum_samples \
+                or len(left_bindings) != 1 or len(right_bindings) != 1:
+            incomplete_groups.append(key)
+            continue
+        baseline_median = statistics.median(float(item["duration_ms"]) for item in left)
+        candidate_median = statistics.median(float(item["duration_ms"]) for item in right)
+        if baseline_median <= 0:
+            incomplete_groups.append(key)
+            continue
+        change_percent = ((candidate_median - baseline_median) / baseline_median) * 100
+        comparisons.append({"task_id": key[0], "wave_id": key[1], "fixture_id": key[2],
+                            "environment_id": key[3], "baseline_samples": len(left),
+                            "candidate_samples": len(right),
+                            "baseline_median_ms": baseline_median,
+                            "candidate_median_ms": candidate_median,
+                            "change_percent": change_percent,
+                            "result": "faster" if candidate_median < baseline_median else "not-faster"})
+    if incomplete_groups:
+        return {"improvement_status": "unverified",
+                "reason": f"all matched groups must have {minimum_samples} stable samples "
+                          "per run and a positive baseline median",
+                "quality_status": "equivalent", "comparisons": comparisons}
+    if not comparisons:
+        return {"improvement_status": "unverified",
+                "reason": f"no matched task/fixture/environment has {minimum_samples} stable samples "
+                          "per run with one start-code binding",
+                "quality_status": "equivalent", "comparisons": []}
+    results = {item["result"] for item in comparisons}
+    status = "improved" if results == {"faster"} else "not-improved" if results == {"not-faster"} else "mixed"
+    return {"improvement_status": status, "reason": "medians use matched completed attempts; "
+            "quality gates and required check/QA plans passed in both runs",
+            "quality_status": "equivalent", "minimum_samples": minimum_samples,
+            "baseline_run_id": baseline.get("run_id"),
+            "candidate_run_id": candidate.get("run_id"),
+            "baseline_quality_evidence_digest": before_quality.get("evidence_digest"),
+            "candidate_quality_evidence_digest": after_quality.get("evidence_digest"),
+            "comparisons": comparisons}
 
 
 def scope_question_digest(run_id: str, question: dict) -> str:
@@ -580,6 +899,64 @@ def write_json_atomic(path: Path, value: dict) -> None:
     os.replace(temporary, path)
 
 
+def recover_supersede_transactions(parent: Path) -> None:
+    for journal_path in sorted(parent.glob(".workflow-supersede-*.json")):
+        if journal_path.is_symlink():
+            raise ValueError("supersede transaction journal cannot be a symlink")
+        journal = json.loads(journal_path.read_text(encoding="utf-8"))
+        if not isinstance(journal, dict) or journal.get("schema_version") != 1:
+            raise ValueError("invalid supersede transaction journal")
+        parent_run_dir = lexical_absolute(Path(journal.get("parent_run_dir", "")))
+        child_run_dir = lexical_absolute(Path(journal.get("child_run_dir", "")))
+        staging_dir = lexical_absolute(Path(journal.get("staging_dir", "")))
+        root = lexical_absolute(parent)
+        if parent_run_dir.parent != root or child_run_dir.parent != root \
+                or staging_dir.parent != root or any(path.is_symlink()
+                                                     for path in (parent_run_dir, child_run_dir, staging_dir)):
+            raise ValueError("supersede journal paths must remain direct local children")
+        parent_handle = (parent_run_dir / ".workflow-state.lock").open("a+b")
+        try:
+            fcntl.flock(parent_handle, fcntl.LOCK_EX)
+            parent_state = read_state(parent_run_dir)
+            child_handle = (child_run_dir / ".workflow-state.lock").open("a+b") \
+                if child_run_dir.is_dir() else None
+            try:
+                if child_handle is not None:
+                    fcntl.flock(child_handle, fcntl.LOCK_EX)
+                child_exists = (child_run_dir / "state.json").is_file()
+                child_state = read_state(child_run_dir) if child_exists else None
+                linked = any(event.get("type") == "run-superseded"
+                             and event.get("superseded_by") == journal.get("child_run_id")
+                             for event in parent_state.get("events", []))
+                committed = (linked and child_state is not None
+                             and parent_state["run_id"] == journal.get("parent_run_id_value")
+                             and child_state["run_id"] == journal.get("child_run_id")
+                             and child_state.get("supersedes_run_id") == parent_state["run_id"])
+                if committed:
+                    journal_path.unlink()
+                    continue
+                if child_state is not None and child_state.get("run_id") == journal.get("child_run_id"):
+                    shutil.rmtree(child_run_dir)
+            finally:
+                if child_handle is not None:
+                    fcntl.flock(child_handle, fcntl.LOCK_UN)
+                    child_handle.close()
+            if staging_dir.exists() and not staging_dir.is_symlink():
+                staged_state_file = staging_dir / "state.json"
+                if staged_state_file.is_file() and read_state(staging_dir).get("run_id") == journal.get("child_run_id"):
+                    shutil.rmtree(staging_dir)
+            filtered = [event for event in parent_state.get("events", [])
+                        if not (event.get("type") == "run-superseded"
+                                and event.get("superseded_by") == journal.get("child_run_id"))]
+            if len(filtered) != len(parent_state.get("events", [])):
+                parent_state["events"] = filtered
+                write_state(parent_run_dir, parent_state)
+            journal_path.unlink()
+        finally:
+            fcntl.flock(parent_handle, fcntl.LOCK_UN)
+            parent_handle.close()
+
+
 def serialized_json(value: dict) -> bytes:
     return (json.dumps(value, ensure_ascii=False, indent=2) + "\n").encode("utf-8")
 
@@ -613,7 +990,7 @@ def recover_file_transaction(run_dir: Path, journal_name: str, expected_targets:
             or not isinstance(journal.get("files"), list):
         raise ValueError(f"invalid {label} recovery journal")
     if label == "report publication" and journal["schema_version"] == 2 \
-            and journal.get("policy_version") != 2:
+            and journal.get("policy_version") not in {2, 3}:
         raise ValueError("unsupported report publication policy version")
     if {item.get("target") for item in journal["files"] if isinstance(item, dict)} != expected_targets:
         raise ValueError(f"{label} journal has an unexpected target")
@@ -933,7 +1310,8 @@ def publish_report(run_dir: Path, state: dict, draft_path: Path) -> tuple[str, s
               stage_transaction_file(run_dir, "scope-register.json", serialized_json(register)),
               stage_transaction_file(run_dir, "state.json", serialized_json(candidate_state))]
     write_json_atomic(run_dir / ".report-publish.pending.json",
-                      {"schema_version": 2, "policy_version": 2, "files": staged})
+                      {"schema_version": 2, "policy_version": state.get("policy_version", 2),
+                       "files": staged})
     recover_report_publish(run_dir)
     return status, report_digest
 
@@ -1105,7 +1483,8 @@ def impact_map(run_dir: Path, state: dict) -> dict | None:
         return None
     require_artifact(run_dir, "impact-map.json")
     value = json.loads(path.read_text(encoding="utf-8"))
-    if not isinstance(value, dict) or set(value) - {"frontend", "backend", "shared", "criteria_paths"}:
+    if not isinstance(value, dict) or set(value) - {
+            "frontend", "backend", "shared", "criteria_paths", "exclusive_paths"}:
         raise ValueError("invalid impact map keys")
     seen = set()
     for owner in ("frontend", "backend", "shared"):
@@ -1130,6 +1509,32 @@ def impact_map(run_dir: Path, state: dict) -> dict | None:
             if not isinstance(item, str):
                 raise ValueError("criterion path must be a glob")
             glob_regex(item)
+    if state.get("policy_version", 1) >= 3:
+        exclusive = value.get("exclusive_paths")
+        if not isinstance(exclusive, dict) or set(exclusive) != {"frontend", "backend", "shared"}:
+            raise ValueError("policy v3 impact map needs exclusive_paths for all owners")
+        exact_seen: dict[tuple[str, str], str] = {}
+        for owner, entries in exclusive.items():
+            if not isinstance(entries, list):
+                raise ValueError("exclusive_paths entries must be arrays")
+            for entry in entries:
+                if not isinstance(entry, dict) or set(entry) != {"path", "reason"} \
+                        or not isinstance(entry["path"], str) or not entry["reason"].strip():
+                    raise ValueError("exclusive path needs an exact path and ownership reason")
+                path = entry["path"]
+                if not path or path.startswith("/") or "\\" in path \
+                        or any(part in {"", ".", ".."} for part in path.split("/")) \
+                        or re.search(r"[*?\[\]{}]", path):
+                    raise ValueError(f"exclusive path must be a normalized exact relative path: {path}")
+                folded = path.casefold()
+                key = (owner, folded)
+                if key in exact_seen or (state.get("checkout_ids", {}).get("frontend")
+                                          == state.get("checkout_ids", {}).get("backend")
+                                          and any(item[1] == folded for item in exact_seen)):
+                    raise ValueError(f"exclusive path ownership overlaps: {path}")
+                exact_seen[key] = owner
+                if default_shared(path) and owner != "shared":
+                    raise ValueError(f"shared path cannot be exclusive: {path}")
     return value
 
 
@@ -1147,6 +1552,60 @@ def impact_owner(path: str, mapping: dict) -> str:
                if any(glob_regex(entry["glob"]).fullmatch(path)
                       for entry in mapping[owner])}
     return next(iter(matched)) if len(matched) == 1 else "shared"
+
+
+def exact_path_owner(path: str, mapping: dict, area: str | None = None) -> str:
+    folded = path.casefold()
+    matches = {owner for owner, entries in mapping["exclusive_paths"].items()
+               if any(entry["path"].casefold() == folded for entry in entries)}
+    if "shared" in matches:
+        return "shared"
+    if area in matches:
+        return area
+    return next(iter(matches)) if len(matches) == 1 else "shared"
+
+
+def repository_changed_paths(repo: Path, base: str | None) -> set[str]:
+    names: set[str] = set()
+    if base:
+        output = git_output(repo, "diff", "--name-status", "-z", "--find-renames", base, "--")
+        fields = output.split(b"\0")
+        index = 0
+        while index < len(fields) and fields[index]:
+            status = fields[index].decode(errors="replace")
+            index += 1
+            path_count = 2 if status.startswith(("R", "C")) else 1
+            for raw in fields[index:index + path_count]:
+                if raw:
+                    names.add(os.fsdecode(raw))
+            index += path_count
+    untracked = git_output(repo, "ls-files", "--others", "--exclude-standard", "-z")
+    names.update(os.fsdecode(raw) for raw in untracked.split(b"\0") if raw)
+    return names
+
+
+def validate_actual_path_ownership(run_dir: Path, state: dict) -> None:
+    if state.get("policy_version", 1) < 3 or state["scope"] != "both":
+        return
+    mapping = impact_map(run_dir, state)
+    if mapping is None:
+        raise ValueError("parallel code review needs the exact ownership map")
+    if state["checkout_ids"]["frontend"] == state["checkout_ids"]["backend"]:
+        repo = repo_for_area(state, "frontend")
+        observed = repository_changed_paths(repo, state.get("base_commits", {}).get("frontend"))
+        unexpected = sorted(path for path in observed
+                            if exact_path_owner(path, mapping) not in {"frontend", "backend"})
+        if unexpected:
+            raise ValueError("same-checkout changes include shared or undeclared paths; "
+                             "stop for design reclassification: " + ", ".join(unexpected))
+        return
+    for area in ("frontend", "backend"):
+        repo = repo_for_area(state, area)
+        observed = repository_changed_paths(repo, state.get("base_commits", {}).get(area))
+        unexpected = sorted(path for path in observed if exact_path_owner(path, mapping, area) != area)
+        if unexpected:
+            raise ValueError(f"{area} changed paths outside exact ownership; serialize and revalidate: "
+                             + ", ".join(unexpected))
 
 
 def code_digest_for(run_dir: Path, state: dict, area: str) -> str:
@@ -1301,7 +1760,7 @@ def check_reviews(run_dir: Path, state: dict) -> None:
 
 
 def check_design(run_dir: Path, state: dict) -> None:
-    risk_guard(state)
+    risk_guard(state, run_dir)
     check_reviews(run_dir, state)
     if state["version"] >= 4:
         plans(run_dir, state)
@@ -1401,7 +1860,8 @@ def check_v4_cases(run_dir: Path, state: dict, area: str, slot: int | None = Non
     current_design = design_digest(run_dir, area)
     current_plans = plan_digests(run_dir, state)
     for scenario in cases[area]:
-        if slot is not None and scenario["slot"] != slot:
+        assigned_slot = scenario_slot(scenario, state)
+        if slot is not None and assigned_slot != slot:
             continue
         scenario_id = scenario["scenario_id"]
         records = latest_events(state, "qa-case", area, "scenario_id", scenario_id,
@@ -1409,7 +1869,7 @@ def check_v4_cases(run_dir: Path, state: dict, area: str, slot: int | None = Non
         records = [record for record in records if record.get("plans") == current_plans]
         if not records or records[-1]["result"] != "pass":
             raise ValueError(f"QA scenario is not passed: {area} {scenario_id}")
-        if records[-1]["slot"] != scenario["slot"] or (agent_id and records[-1]["agent_id"] != agent_id):
+        if records[-1]["slot"] != assigned_slot or (agent_id and records[-1]["agent_id"] != agent_id):
             raise ValueError(f"QA scenario owner does not match: {area} {scenario_id}")
         event_index = next(index for index in range(len(state["events"]) - 1, -1, -1)
                            if state["events"][index] is records[-1])
@@ -1468,7 +1928,7 @@ def check_final_v4(run_dir: Path, state: dict) -> None:
 
 
 def check_final(run_dir: Path, state: dict) -> None:
-    risk_guard(state)
+    risk_guard(state, run_dir)
     if state["version"] >= 4:
         check_final_v4(run_dir, state)
         return
@@ -1543,6 +2003,16 @@ def parse_legacy_bases(values: list[str]) -> dict[str, str]:
             raise ValueError("--legacy-base must be a unique AREA=REF value")
         parsed[area] = reference.strip()
     return parsed
+
+
+def required_plan_baseline(run_dir: Path, state: dict) -> dict:
+    checks, cases = plans(run_dir, state)
+    return {"schema_version": 1,
+            "verification": {area: [dict(item) for item in entries if item["required"]]
+                             for area, entries in checks.items()},
+            "qa": {area: [dict(item) for item in entries] for area, entries in cases.items()},
+            "criteria": {area: sorted(acceptance_ids(run_dir, area))
+                         for area in areas_for(state["scope"])} }
 
 
 def migrate_run_to_v8(run_dir: Path, state: dict,
@@ -1620,6 +2090,11 @@ def migrate_run_to_v8(run_dir: Path, state: dict,
 
 
 def workflow_status(run_dir: Path, state: dict) -> dict:
+    superseded = next((event for event in reversed(state.get("events", []))
+                       if event.get("type") == "run-superseded"), None)
+    if superseded:
+        return {"stage": "superseded", "next_action": "continue-superseding-run",
+                "blocker": f"superseded by {superseded.get('superseded_by')}", "complete": False}
     if (state.get("version", 0) < 7 and legacy_run_complete(run_dir, state)) or completed_run(run_dir, state):
         return {"stage": "complete", "next_action": "none", "blocker": None, "complete": True}
     for area in review_areas(state["scope"]):
@@ -1713,11 +2188,14 @@ def main() -> int:
     initialize.add_argument("--backend-repo", type=Path)
     initialize.add_argument("--integration-repo", type=Path)
     initialize.add_argument("--new-run", action="store_true")
+    initialize.add_argument("--supersede-run", type=Path,
+                            help="Create a full run that inherits required plans from an exact prior run")
     initialize.add_argument("--scope", choices=("frontend", "backend", "both"))
     initialize.add_argument("--review-mode", choices=("immediate", "user-review"))
     initialize.add_argument("--mode-reference",
                             help="Reference to the user's answer for this implementation request")
-    initialize.add_argument("--review-depth", choices=("light", "full"))
+    initialize.add_argument("--review-depth", choices=("light", "balanced", "full"))
+    initialize.add_argument("--risk-level", choices=("low", "medium", "high", "unknown"))
     initialize.add_argument("--risk-reason", default="")
     initialize.add_argument("--run-dir", type=Path)
     initialize.add_argument("--parent-dir", type=Path,
@@ -1728,7 +2206,8 @@ def main() -> int:
                             help="Trusted start commit for a legacy run missing its baseline; repeat per area")
     for command in ("present", "review", "approve", "accept-design", "agent-result", "resolve-agent",
                     "check-record", "resolve-check", "qa-case", "resolve-qa-case",
-                    "scope-question", "scope-answer", "report-publish", "check", "status"):
+                    "scope-question", "scope-answer", "report-publish", "check", "status",
+                    "timing-start", "timing-finish", "timing-summary"):
         sub = commands.add_parser(command)
         sub.add_argument("--run-dir", type=Path, required=True)
         if command in {"present", "review", "approve", "agent-result", "resolve-agent", "check-record",
@@ -1736,6 +2215,7 @@ def main() -> int:
             sub.add_argument("--area", choices=("frontend", "backend", "integration"), required=True)
         if command == "review":
             sub.add_argument("--result", choices=("clear", "changes-required"), required=True)
+            sub.add_argument("--risk-level", choices=("low", "medium", "high", "unknown"))
             sub.add_argument("--finding", default="")
             sub.add_argument("--slot", type=int, choices=REVIEW_SLOTS)
             sub.add_argument("--agent-id")
@@ -1750,6 +2230,7 @@ def main() -> int:
             sub.add_argument("--reference", required=True, help="Reference to the user's actual approval")
         elif command == "agent-result":
             sub.add_argument("--stage", choices=("code-review", "qa"), required=True)
+            sub.add_argument("--risk-level", choices=("low", "medium", "high", "unknown"))
             sub.add_argument("--slot", type=int, choices=REVIEW_SLOTS, required=True)
             sub.add_argument("--agent-id", required=True)
             sub.add_argument("--result", choices=("clear", "findings", "pass", "fail", "not-run"), required=True)
@@ -1809,9 +2290,24 @@ def main() -> int:
             sub.add_argument("--reference", required=True)
         elif command == "report-publish":
             sub.add_argument("--draft-file", type=Path, required=True)
+        elif command == "timing-start":
+            sub.add_argument("--task-id", required=True)
+            sub.add_argument("--wave-id", required=True)
+            sub.add_argument("--wave-execution-id", required=True)
+            sub.add_argument("--fixture-id", required=True)
+            sub.add_argument("--environment-id", required=True)
+        elif command == "timing-finish":
+            sub.add_argument("--attempt-id", required=True)
+            sub.add_argument("--log-file", type=Path, required=True)
+        elif command == "timing-summary":
+            sub.add_argument("--baseline-run-dir", type=Path,
+                             help="Compare with a completed baseline run using three matched samples")
     args = parser.parse_args()
 
     lock_handle = None
+    supersede_handle = None
+    supersede_journal = None
+    parent_marked_superseded = False
     try:
         if args.command == "init":
             legacy_bases = parse_legacy_bases(args.legacy_base)
@@ -1819,10 +2315,14 @@ def main() -> int:
                 raise ValueError("--legacy-base requires exact --resume-run without --new-run")
             if args.resume_run and (args.work_item or args.run_dir or args.parent_dir or args.new_run):
                 raise ValueError("--resume-run cannot be combined with run creation or work-item selection")
+            if args.supersede_run and (args.resume_run or not args.new_run or args.work_item is None):
+                raise ValueError("--supersede-run needs --new-run and a stable --work-item")
             if args.resume_run:
                 run_dir = lexical_absolute(args.resume_run)
                 state = read_state(run_dir)
                 ensure_local_run_dir(run_dir, repo_for_area(state, areas_for(state["scope"])[0]), allow_legacy=True)
+                recover_run_transactions(run_dir)
+                state = read_state(run_dir)
                 lock_handle = (run_dir / ".workflow-state.lock").open("a+b")
                 fcntl.flock(lock_handle, fcntl.LOCK_EX)
                 recover_report_publish(run_dir, repair_legacy=True)
@@ -1864,6 +2364,15 @@ def main() -> int:
             if not args.scope:
                 raise ValueError("a new run or work-item resume needs --scope")
             review_depth_value = args.review_depth or "full"
+            policy_version = 3
+            selected_risk_level = args.risk_level or "unknown"
+            selected_risk_reason = args.risk_reason.strip() or "risk was not classified; full review is required"
+            if review_depth_value == "balanced" and policy_version < 3:
+                raise ValueError("balanced requires policy v3 and an explicit risk level")
+            if policy_version >= 3 and review_depth_value != "full" and args.risk_level is None:
+                raise ValueError("light/balanced review needs an explicit --risk-level")
+            if args.risk_level is not None and not args.risk_reason.strip():
+                raise ValueError("an explicit --risk-level needs --risk-reason")
             if args.scope == "both" and review_depth_value == "light":
                 raise ValueError("light review needs one area and a risk reason")
             if args.scope == "both":
@@ -1891,6 +2400,45 @@ def main() -> int:
             checkout_ids = {area: checkout_identity(selected[area]) for area in review_areas(args.scope)}
             parent = run_dir.parent
             with file_lock(parent / ".workflow-init.lock"):
+                recover_supersede_transactions(parent)
+                parent_run_dir = None
+                parent_state = None
+                inherited_baseline = None
+                if args.supersede_run:
+                    if policy_version < 3 or review_depth_value != "full" \
+                            or args.risk_level not in {"medium", "high", "unknown"}:
+                        raise ValueError("superseding run must be policy v3 full with medium/high/unknown risk")
+                    parent_run_dir = lexical_absolute(args.supersede_run)
+                    if parent_run_dir.parent != parent:
+                        raise ValueError("superseding run must use the same local docs work folder as its parent")
+                    ensure_local_run_dir(parent_run_dir, selected.get("backend") or selected["frontend"])
+                    parent_state = read_state(parent_run_dir)
+                    supersede_handle = (parent_run_dir / ".workflow-state.lock").open("a+b")
+                    fcntl.flock(supersede_handle, fcntl.LOCK_EX)
+                    try:
+                        parent_state = read_state(parent_run_dir)
+                        if parent_state["scope"] != args.scope:
+                            raise ValueError("superseding run must preserve the previous work scope")
+                        old_roots = parent_state.get("repo_roots", {})
+                        if any(old_roots.get(area) != str(selected[area])
+                               for area in review_areas(args.scope)):
+                            raise ValueError("superseding run must use the same repository roots")
+                        if any(parent_state.get("checkout_ids", {}).get(area) != checkout_ids[area]
+                               for area in review_areas(args.scope)):
+                            raise ValueError("superseding run must use the same Git checkouts")
+                        if completed_run(parent_run_dir, parent_state):
+                            raise ValueError("a completed run cannot be superseded")
+                        if any(event.get("type") == "run-superseded"
+                               for event in parent_state.get("events", [])):
+                            raise ValueError("previous run is already superseded")
+                        if parent_state.get("work_item") != args.work_item:
+                            raise ValueError("superseding run must preserve the previous work item")
+                        inherited_baseline = required_plan_baseline(parent_run_dir, parent_state)
+                    except Exception:
+                        fcntl.flock(supersede_handle, fcntl.LOCK_UN)
+                        supersede_handle.close()
+                        supersede_handle = None
+                        raise
                 if args.work_item and not args.new_run:
                     work_item_states = []
                     candidates = []
@@ -1941,14 +2489,19 @@ def main() -> int:
                     parser.error("a new run needs --review-mode and this request's --mode-reference")
                 if not args.mode_reference.strip():
                     raise ValueError("a new run needs --review-mode and this request's --mode-reference")
-                state = {"version": 8, "policy_version": 2,
-                         "run_id": "v8p2-" + uuid.uuid4().hex,
+                state = {"version": 8, "policy_version": policy_version,
+                         "run_id": f"v8p{policy_version}-" + uuid.uuid4().hex,
                          "work_item": args.work_item, "repo_root": str(repo_root),
                          "repo_roots": {area: str(root) for area, root in selected.items()},
                          "checkout_ids": checkout_ids, "scope": args.scope,
                          "review_mode": args.review_mode, "mode_reference": args.mode_reference,
                          "review_depth": review_depth_value,
-                         "risk_reason": args.risk_reason.strip(), "events": []}
+                         "risk_reason": selected_risk_reason, "events": []}
+                if policy_version >= 3:
+                    state["risk_level"] = selected_risk_level
+                if parent_state is not None:
+                    state["supersedes_run_id"] = parent_state["run_id"]
+                    state["required_plan_baseline"] = inherited_baseline
                 state["base_commits"] = {}
                 for area in review_areas(args.scope):
                     result = subprocess.run(["git", "-C", str(selected[area]), "rev-parse",
@@ -1969,20 +2522,144 @@ def main() -> int:
                                       {"schema_version": 1, "questions": []})
                     write_json_atomic(staging_dir / "run-policy.json",
                                       run_policy_data(state["run_id"], state["policy_version"]))
+                    if parent_state is not None:
+                        supersede_journal = parent / f".workflow-supersede-{state['run_id']}.json"
+                        write_json_atomic(supersede_journal, {
+                            "schema_version": 1, "parent_run_dir": str(parent_run_dir),
+                            "parent_run_id_value": parent_state["run_id"],
+                            "child_run_dir": str(run_dir), "child_run_id": state["run_id"],
+                            "staging_dir": str(staging_dir)})
                     os.replace(staging_dir, run_dir)
+                    if parent_state is not None:
+                        latest_parent = read_state(parent_run_dir)
+                        if latest_parent["run_id"] != parent_state["run_id"] \
+                                or latest_parent.get("work_item") != args.work_item \
+                                or completed_run(parent_run_dir, latest_parent) \
+                                or required_plan_baseline(parent_run_dir, latest_parent) != inherited_baseline \
+                                or any(event.get("type") == "run-superseded"
+                                       for event in latest_parent.get("events", [])):
+                            shutil.rmtree(run_dir, ignore_errors=True)
+                            raise ValueError("previous run changed during superseding initialization")
+                        latest_parent["events"].append({"type": "run-superseded",
+                                                        "run_id": latest_parent["run_id"],
+                                                        "superseded_by": state["run_id"],
+                                                        "at": datetime.now(timezone.utc).isoformat()})
+                        write_state(parent_run_dir, latest_parent)
+                        parent_marked_superseded = True
+                    if supersede_journal is not None:
+                        supersede_journal.unlink()
                 except Exception:
                     shutil.rmtree(staging_dir, ignore_errors=True)
+                    if parent_state is not None and not parent_marked_superseded:
+                        if run_dir.is_dir() and not run_dir.is_symlink():
+                            try:
+                                if read_state(run_dir).get("run_id") == state["run_id"]:
+                                    shutil.rmtree(run_dir)
+                            except (OSError, ValueError, KeyError, json.JSONDecodeError):
+                                pass
+                        if supersede_journal is not None:
+                            supersede_journal.unlink(missing_ok=True)
                     raise
                 print(run_dir)
                 return 0
 
         run_dir = lexical_absolute(args.run_dir)
         state = read_state(run_dir)
+        ensure_local_run_dir(run_dir, repo_for_area(state, areas_for(state["scope"])[0]), allow_legacy=True)
+        recover_run_transactions(run_dir)
+        state = read_state(run_dir)
         lock_handle = (run_dir / ".workflow-state.lock").open("a+b")
         fcntl.flock(lock_handle, fcntl.LOCK_EX)
         recover_report_publish(run_dir, repair_legacy=True)
         recover_legacy_migration(run_dir)
         state = read_state(run_dir)
+        if args.command == "timing-start":
+            if not args.task_id.strip() or not args.wave_id.strip() \
+                    or not args.wave_execution_id.strip() or not args.fixture_id.strip() \
+                    or not args.environment_id.strip():
+                raise ValueError("timing task, wave, execution, fixture, and environment IDs cannot be empty")
+            attempt_id = uuid.uuid4().hex
+            execution_starts = [event for event in state["events"]
+                                if event.get("type") == "timing-start"
+                                and event.get("wave_execution_id") == args.wave_execution_id]
+            session_id = monotonic_session_id()
+            plan_snapshot = plan_digests(run_dir, state)
+            expected_execution = (args.wave_id, args.fixture_id, args.environment_id,
+                                  json.dumps(plan_snapshot, sort_keys=True), session_id)
+            for previous in execution_starts:
+                observed = (previous.get("wave_id"), previous.get("fixture_id"),
+                            previous.get("environment_id"),
+                            json.dumps(previous.get("plan_digests", {}), sort_keys=True),
+                            previous.get("session_id"))
+                if observed != expected_execution:
+                    raise ValueError("wave execution ID is already bound to different wave, fixture, "
+                                     "environment, plan, or clock session; use a new unique ID")
+                if previous.get("task_id") == args.task_id:
+                    raise ValueError("task already has a timing attempt in this wave execution; "
+                                     "use a new unique execution ID for retries")
+            event = {"type": "timing-start", "event_id": uuid.uuid4().hex,
+                     "attempt_id": attempt_id, "run_id": state["run_id"],
+                     "task_id": args.task_id, "wave_id": args.wave_id,
+                     "wave_execution_id": args.wave_execution_id,
+                     "fixture_id": args.fixture_id, "environment_id": args.environment_id,
+                     "session_id": session_id,
+                     "started_monotonic_ns": time.perf_counter_ns(),
+                     "started_at": datetime.now(timezone.utc).isoformat(),
+                     "plan_digests": plan_snapshot,
+                     "code_binding": timing_code_binding(run_dir, state)}
+            state["events"].append(event)
+            write_state(run_dir, state)
+            print(json.dumps({"attempt_id": attempt_id, "event_id": event["event_id"],
+                              "session_id": event["session_id"]}, ensure_ascii=False))
+            return 0
+        if args.command == "timing-finish":
+            starts = [event for event in state["events"]
+                      if event.get("type") == "timing-start"
+                      and event.get("attempt_id") == args.attempt_id]
+            if len(starts) != 1:
+                raise ValueError("timing attempt must match exactly one start event")
+            start = starts[0]
+            if any(event.get("type") == "timing-finish"
+                   and event.get("attempt_id") == args.attempt_id for event in state["events"]):
+                raise ValueError("timing attempt is already finished")
+            if start.get("run_id") != state["run_id"] \
+                    or start.get("session_id") != monotonic_session_id():
+                raise ValueError("timing attempt belongs to another run or monotonic clock session")
+            current_plans = plan_digests(run_dir, state)
+            if start.get("plan_digests") != current_plans:
+                raise ValueError("timing plan changed during this attempt; start a new attempt")
+            log_name, log_digest = evidence_digest(run_dir, str(args.log_file))
+            log_path = run_dir / log_name
+            if not log_path.is_file() or log_path.stat().st_size == 0:
+                raise ValueError("timing log must be a nonempty local file")
+            finished_ns = time.perf_counter_ns()
+            finish = {"type": "timing-finish", "event_id": uuid.uuid4().hex,
+                      "attempt_id": args.attempt_id, "start_event_id": start["event_id"],
+                      "run_id": state["run_id"], "session_id": start["session_id"],
+                      "finished_monotonic_ns": finished_ns,
+                      "finished_at": datetime.now(timezone.utc).isoformat(),
+                      "plan_digests": current_plans,
+                      "log_file": log_name, "log_digest": log_digest,
+                      "code_binding": timing_code_binding(run_dir, state)}
+            state["events"].append(finish)
+            write_state(run_dir, state)
+            print(json.dumps({"attempt_id": args.attempt_id,
+                              "duration_ms": (finished_ns - start["started_monotonic_ns"]) / 1_000_000,
+                              "recorded": True}, ensure_ascii=False))
+            return 0
+        if args.command == "timing-summary":
+            summary = timing_summary_data(state, run_dir)
+            if args.baseline_run_dir is not None:
+                baseline_dir = lexical_absolute(args.baseline_run_dir)
+                if baseline_dir == run_dir:
+                    raise ValueError("baseline and candidate must be different runs")
+                baseline_state = read_state(baseline_dir)
+                baseline_repo = repo_for_area(baseline_state, areas_for(baseline_state["scope"])[0])
+                ensure_local_run_dir(baseline_dir, baseline_repo, allow_legacy=True)
+                baseline_summary = timing_summary_data(baseline_state, baseline_dir)
+                summary.update(compare_timing_summaries(baseline_summary, summary))
+            print(json.dumps(summary, ensure_ascii=False, indent=2))
+            return 0
         if args.command == "status":
             print(json.dumps(workflow_status(run_dir, state), ensure_ascii=False))
             return 0
@@ -2074,11 +2751,15 @@ def main() -> int:
                     raise ValueError("design review focus does not match slot")
                 if state["version"] >= 4:
                     plans(run_dir, state)
+                if state.get("policy_version", 1) >= 3 and args.risk_level is None:
+                    raise ValueError("policy v3 design review needs --risk-level")
                 review_file = agent_artifact("design-review", args.area, args.slot)
                 event = {"type": "review", "area": args.area, "slot": args.slot,
                                         "agent_id": args.agent_id.strip(), "result": args.result,
                                         "finding": args.finding, "digest": design_digest(run_dir, args.area),
                                         "artifact_digest": artifact_digest(run_dir, review_file)}
+                if state.get("policy_version", 1) >= 3:
+                    event["risk_level"] = args.risk_level
                 if state["version"] >= 4:
                     event["focus"] = args.focus
                     event["plans"] = plan_digests(run_dir, state)
@@ -2087,7 +2768,7 @@ def main() -> int:
                         raise ValueError("v5 design review needs --result-json")
                     event.update(result_binding(run_dir, args.result_json, "design-review",
                                                 args.area, args.slot, args.agent_id.strip(),
-                                                args.focus, args.result))
+                                                args.focus, args.result, args.risk_level))
                     if any(old.get("result_json") == event["result_json"] for old in state["events"]):
                         raise ValueError("result JSON must be unique for every attempt")
                     event.update(model_selection(args.model, args.effort, args.model_reason))
@@ -2157,6 +2838,9 @@ def main() -> int:
             if args.stage == "code-review":
                 if args.area == "integration" or args.result not in {"clear", "findings"}:
                     raise ValueError("code-review requires a frontend/backend area and clear/findings result")
+                if state.get("policy_version", 1) >= 3 and args.risk_level is None:
+                    raise ValueError("policy v3 code review needs --risk-level")
+                validate_actual_path_ownership(run_dir, state)
                 check_design(run_dir, state)
                 if state["version"] >= 4:
                     check_v4_checks(run_dir, state, args.area)
@@ -2167,6 +2851,7 @@ def main() -> int:
                     raise ValueError("v4 QA summary requires pass; record failures with qa-case")
             current_code = code_digest_for(run_dir, state, args.area)
             if args.stage == "qa":
+                risk_guard(state, run_dir)
                 if args.area == "integration":
                     for area in areas_for(state["scope"]):
                         if state["version"] >= 4:
@@ -2184,6 +2869,8 @@ def main() -> int:
                                     "result": args.result, "digest": current_code,
                                     "design_digest": design_digest(run_dir, args.area),
                                     "artifact_digest": artifact_digest(run_dir, report)}
+            if args.stage == "code-review" and state.get("policy_version", 1) >= 3:
+                event["risk_level"] = args.risk_level
             if state["version"] >= 4:
                 event["focus"] = args.focus
                 event["plans"] = plan_digests(run_dir, state)
@@ -2192,13 +2879,16 @@ def main() -> int:
                     raise ValueError("v5 agent result needs --result-json")
                 event.update(result_binding(run_dir, args.result_json, args.stage,
                                             args.area, args.slot, args.agent_id.strip(),
-                                            args.focus, args.result))
+                                            args.focus, args.result,
+                                            args.risk_level if args.stage == "code-review" else None))
                 if any(old.get("result_json") == event["result_json"] for old in state["events"]):
                     raise ValueError("result JSON must be unique for every attempt")
                 event.update(model_selection(args.model, args.effort, args.model_reason))
                 event.update(context_selection(args.context_mode, args.context_reason))
             state["events"].append(event)
             write_state(run_dir, state)
+            if args.stage == "code-review" and state.get("policy_version", 1) >= 3:
+                risk_guard(state, run_dir)
         elif args.command == "resolve-agent":
             if state["version"] < 3 or not args.reference.strip():
                 raise ValueError("agent resolution requires a nonempty reference")
@@ -2301,9 +2991,10 @@ def main() -> int:
             if state["version"] < 4:
                 raise ValueError("qa-case requires a v4 run")
             require_design_gate(run_dir, state)
+            risk_guard(state, run_dir)
             _, cases = plans(run_dir, state)
             scenario = plan_case(cases, args.area, args.scenario_id)
-            if scenario is None or scenario["slot"] != args.slot:
+            if scenario is None or scenario_slot(scenario, state) != args.slot:
                 raise ValueError("QA scenario and slot must match the plan")
             if not args.agent_id.strip() or not args.environment.strip() or not args.input.strip() \
                     or not args.actual.strip():
@@ -2356,7 +3047,7 @@ def main() -> int:
             require_design_gate(run_dir, state)
             _, cases = plans(run_dir, state)
             scenario = plan_case(cases, args.area, args.scenario_id)
-            if scenario is None or scenario["slot"] != args.slot:
+            if scenario is None or scenario_slot(scenario, state) != args.slot:
                 raise ValueError("QA scenario and slot must match the plan")
             current_code = code_digest_for(run_dir, state, args.area)
             current_design = design_digest(run_dir, args.area)
@@ -2391,6 +3082,9 @@ def main() -> int:
         print(f"workflow harness: {error}", file=sys.stderr)
         return 1
     finally:
+        if supersede_handle is not None:
+            fcntl.flock(supersede_handle, fcntl.LOCK_UN)
+            supersede_handle.close()
         if lock_handle is not None:
             fcntl.flock(lock_handle, fcntl.LOCK_UN)
             lock_handle.close()

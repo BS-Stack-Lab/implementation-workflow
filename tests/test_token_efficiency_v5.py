@@ -21,7 +21,7 @@ from review_brief import brief  # noqa: E402
 from run_check import capture  # noqa: E402
 from workflow_harness import (artifact_digest, code_digest_for, design_digest,  # noqa: E402
                               impact_map, manifest_binding, plan_digests,
-                              result_binding, verify_all_evidence)
+                              result_binding, run_policy_data, verify_all_evidence)
 
 
 class TokenEfficiencyV5Test(unittest.TestCase):
@@ -234,7 +234,7 @@ class TokenEfficiencyV5Test(unittest.TestCase):
                        {"gpt-6-luna": ["medium"]}, "gpt-6-luna", "medium")
         self.assertEqual({item["id"] for item in output["open_findings"]}, {"C1", "s2"})
         skill = (ROOT / "skills" / "implementation-workflow" / "SKILL.md").read_text()
-        for policy in ("질문 UI", "설계 변경 승인", "설계 검토 1명", "서로 다른 3명", "~/Documents/docs/"):
+        for policy in ("질문 UI", "설계 변경 승인", "balanced", "서로 다른 3명", "~/Documents/docs/"):
             self.assertIn(policy, skill)
         for name in ("intake-design.md", "implementation-check.md", "review-qa.md"):
             self.assertIn(name, skill)
@@ -429,7 +429,9 @@ class TokenEfficiencyV5Test(unittest.TestCase):
         state = json.loads((run / "state.json").read_text())
         self.assertEqual(state["version"], 8)
         state["version"] = 5
+        state["policy_version"] = 1
         (run / "state.json").write_text(json.dumps(state))
+        (run / "run-policy.json").write_text(json.dumps(run_policy_data(state["run_id"], 1)))
         (run / "backend-design.md").write_text("## 수용 기준\nR1. expected\n")
         (run / "verification-plan.json").write_text(json.dumps({"backend": [
             {"id": "tests", "kind": "test", "command": "python3 -c 'exit(0)'", "required": True}]}))

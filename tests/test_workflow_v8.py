@@ -34,6 +34,7 @@ class WorkflowHarnessV8Test(unittest.TestCase):
         self.environment = {**os.environ, "HOME": str(self.home)}
         self.call("init", "--repo", str(self.repo), "--scope", "backend",
                   "--review-mode", "immediate", "--mode-reference", "user chose immediate",
+                  "--risk-level", "low", "--risk-reason", "isolated test fixture",
                   "--run-dir", str(self.run_dir))
 
     def call(self, *args: str, expected: int = 0) -> subprocess.CompletedProcess[str]:
@@ -621,7 +622,7 @@ class WorkflowHarnessV8Test(unittest.TestCase):
         self.assertTrue((self.run_dir / "scope-register.json").is_file())
         policy = json.loads((self.run_dir / "run-policy.json").read_text(encoding="utf-8"))
         state = json.loads((self.run_dir / "state.json").read_text(encoding="utf-8"))
-        self.assertEqual(policy, workflow_harness.run_policy_data(state["run_id"], 2))
+        self.assertEqual(policy, workflow_harness.run_policy_data(state["run_id"], 3))
         self.assertFalse(any(self.run_dir.parent.glob(".workflow-init-*")))
 
     def test_exact_resume_promotes_incomplete_legacy_run_with_snapshot(self) -> None:

@@ -14,7 +14,9 @@ ROOT = Path(__file__).resolve().parents[1]
 HARNESS = ROOT / "scripts" / "workflow_harness.py"
 RUN_CHECK = ROOT / "scripts" / "run_check.py"
 sys.path.insert(0, str(ROOT / "scripts"))
-from workflow_harness import checkout_identity, code_digest_for, read_state, risk_guard
+from workflow_harness import (checkout_identity, code_digest_for, read_state,
+                              recover_supersede_transactions, risk_guard, plans,
+                              validate_actual_path_ownership)
 from review_brief import changed_paths
 
 
@@ -76,6 +78,14 @@ class MultiRepoV7Test(unittest.TestCase):
                         for index, kind in enumerate(kinds)] for area in areas}
         (run_dir / "verification-plan.json").write_text(json.dumps(checks), encoding="utf-8")
         (run_dir / "qa-plan.json").write_text(json.dumps(cases), encoding="utf-8")
+        (run_dir / "impact-map.json").write_text(json.dumps({
+            "frontend": [{"glob": "ui/**", "reason": "frontend source"}],
+            "backend": [{"glob": "api/**", "reason": "backend source"}],
+            "shared": [], "criteria_paths": {},
+            "exclusive_paths": {
+                "frontend": [{"path": "app.txt", "reason": "frontend source"}],
+                "backend": [{"path": "app.txt", "reason": "backend source"}],
+                "shared": []}}), encoding="utf-8")
 
     def test_separate_roots_are_recorded_and_resumed_for_same_work_item(self) -> None:
         run_dir = self.initialize()
@@ -88,6 +98,79 @@ class MultiRepoV7Test(unittest.TestCase):
         marker.write_text("existing draft\n", encoding="utf-8")
         self.assertEqual(self.initialize(), run_dir)
         self.assertEqual(marker.read_text(encoding="utf-8"), "existing draft\n")
+
+    def test_medium_risk_escalation_can_create_superseding_full_run(self) -> None:
+        parent_run = self.initialize()
+        self.write_design_and_plans(parent_run)
+        (parent_run / "official-sources.json").write_text(json.dumps({
+            "schema_version": 1, "status": "not_applicable", "sources": [],
+            "reason": "fixture only exercises superseding risk profile"}), encoding="utf-8")
+        result = self.call(HARNESS, "init", "--scope", "both",
+                           "--frontend-repo", str(self.frontend),
+                           "--backend-repo", str(self.backend),
+                           "--new-run", "--supersede-run", str(parent_run),
+                           "--review-mode", "immediate",
+                           "--mode-reference", "reviewer raised the risk to medium",
+                           "--review-depth", "full", "--risk-level", "medium",
+                           "--risk-reason", "independent reviewer found cross-area impact",
+                           "--work-item", "account-settings")
+        child_run = Path(result.stdout.strip()).resolve()
+        self.assertEqual(read_state(child_run)["supersedes_run_id"], read_state(parent_run)["run_id"])
+        self.assertEqual(read_state(child_run)["risk_level"], "medium")
+
+    def test_superseding_run_requires_same_docs_parent_folder(self) -> None:
+        parent_run = self.initialize()
+        other_parent = self.home / "Documents" / "docs" / "other-work-folder"
+        other_parent.mkdir(parents=True)
+        result = self.call(HARNESS, "init", "--scope", "both",
+                           "--frontend-repo", str(self.frontend),
+                           "--backend-repo", str(self.backend),
+                           "--new-run", "--supersede-run", str(parent_run),
+                           "--parent-dir", str(other_parent),
+                           "--review-mode", "immediate",
+                           "--mode-reference", "reviewer raised the risk to medium",
+                           "--review-depth", "full", "--risk-level", "medium",
+                           "--risk-reason", "independent reviewer found cross-area impact",
+                           "--work-item", "account-settings", success=False)
+        self.assertIn("same local docs work folder", result.stderr)
+
+    def test_declared_shared_paths_block_at_design_plan_gate(self) -> None:
+        run_dir = self.initialize()
+        self.write_design_and_plans(run_dir)
+        (run_dir / "official-sources.json").write_text(json.dumps({
+            "schema_version": 1, "status": "not_applicable", "sources": [],
+            "reason": "fixture only exercises the shared-path design gate"}), encoding="utf-8")
+        impact_path = run_dir / "impact-map.json"
+        mapping = json.loads(impact_path.read_text(encoding="utf-8"))
+        mapping["shared"] = [{"glob": "contracts/account.json", "reason": "shared contract"}]
+        mapping["exclusive_paths"]["shared"] = [
+            {"path": "contracts/account.json", "reason": "shared contract"}]
+        impact_path.write_text(json.dumps(mapping), encoding="utf-8")
+        with self.assertRaisesRegex(ValueError, "separate single-area full run"):
+            plans(run_dir, read_state(run_dir))
+        with self.assertRaisesRegex(ValueError, "Commit the reviewed contract locally"):
+            plans(run_dir, read_state(run_dir))
+
+    def test_shared_path_change_is_rejected_in_same_checkout(self) -> None:
+        result = self.call(HARNESS, "init", "--scope", "both", "--repo", str(self.backend),
+                           "--review-mode", "immediate",
+                           "--mode-reference", "user selected immediate for this request",
+                           "--review-depth", "full", "--work-item", "shared-contract")
+        run_dir = Path(result.stdout.strip()).resolve()
+        state = read_state(run_dir)
+        mapping = {"frontend": [{"glob": "ui/**", "reason": "frontend code"}],
+                   "backend": [{"glob": "api/**", "reason": "backend code"}],
+                   "shared": [], "criteria_paths": {},
+                   "exclusive_paths": {
+                       "frontend": [{"path": "ui/page.tsx", "reason": "frontend code"}],
+                       "backend": [{"path": "api/handler.py", "reason": "backend code"}],
+                       "shared": []}}
+        (run_dir / "impact-map.json").write_text(json.dumps(mapping), encoding="utf-8")
+        shared_file = self.backend / "contracts" / "foo.json"
+        shared_file.parent.mkdir()
+        shared_file.write_text("{}\n", encoding="utf-8")
+        with self.assertRaisesRegex(ValueError, "shared or undeclared paths"):
+            validate_actual_path_ownership(run_dir, state)
 
     def test_committed_change_remains_visible_from_saved_base(self) -> None:
         base = subprocess.run(["git", "-C", str(self.frontend), "rev-parse", "HEAD"],
@@ -105,7 +188,8 @@ class MultiRepoV7Test(unittest.TestCase):
                            "--repo", str(self.backend),
                            "--review-mode", "immediate",
                            "--mode-reference", "user selected immediate for this request",
-                           "--review-depth", "light", "--risk-reason", "small change",
+                           "--review-depth", "light", "--risk-level", "low",
+                           "--risk-reason", "small change",
                            "--work-item", "account-settings")
         run_dir = Path(result.stdout.strip()).resolve()
         (self.backend / "auth.py").write_text("changed\n", encoding="utf-8")
@@ -150,6 +234,49 @@ class MultiRepoV7Test(unittest.TestCase):
         status = json.loads(self.call(HARNESS, "status", "--run-dir", str(run_dir)).stdout)
         self.assertEqual(status["next_action"], "wait-user")
         self.assertFalse(status["complete"])
+
+    def test_supersede_recovery_rolls_back_orphan_child(self) -> None:
+        parent_run = self.initialize()
+        parent_state = read_state(parent_run)
+        child_id = "v8p3-recovery-child"
+        child_run = parent_run.parent / "run-recovery-child"
+        child_state = dict(parent_state)
+        child_state.update({"run_id": child_id, "supersedes_run_id": parent_state["run_id"],
+                            "events": []})
+        child_run.mkdir()
+        (child_run / "state.json").write_text(json.dumps(child_state), encoding="utf-8")
+        journal = parent_run.parent / f".workflow-supersede-{child_id}.json"
+        journal.write_text(json.dumps({"schema_version": 1,
+            "parent_run_dir": str(parent_run), "parent_run_id_value": parent_state["run_id"],
+            "child_run_dir": str(child_run), "child_run_id": child_id,
+            "staging_dir": str(parent_run.parent / ".workflow-init-recovery")}))
+        recover_supersede_transactions(parent_run.parent)
+        self.assertFalse(child_run.exists())
+        self.assertFalse(journal.exists())
+        self.assertFalse(any(event.get("type") == "run-superseded"
+                             for event in read_state(parent_run)["events"]))
+
+    def test_supersede_recovery_keeps_committed_child(self) -> None:
+        parent_run = self.initialize()
+        parent_state = read_state(parent_run)
+        child_id = "v8p3-recovery-committed"
+        child_run = parent_run.parent / "run-recovery-committed"
+        child_state = dict(parent_state)
+        child_state.update({"run_id": child_id, "supersedes_run_id": parent_state["run_id"],
+                            "events": []})
+        child_run.mkdir()
+        (child_run / "state.json").write_text(json.dumps(child_state), encoding="utf-8")
+        parent_state["events"].append({"type": "run-superseded", "run_id": parent_state["run_id"],
+                                        "superseded_by": child_id})
+        (parent_run / "state.json").write_text(json.dumps(parent_state), encoding="utf-8")
+        journal = parent_run.parent / f".workflow-supersede-{child_id}.json"
+        journal.write_text(json.dumps({"schema_version": 1,
+            "parent_run_dir": str(parent_run), "parent_run_id_value": parent_state["run_id"],
+            "child_run_dir": str(child_run), "child_run_id": child_id,
+            "staging_dir": str(parent_run.parent / ".workflow-init-recovery")}))
+        recover_supersede_transactions(parent_run.parent)
+        self.assertTrue(child_run.is_dir())
+        self.assertFalse(journal.exists())
 
     def test_integration_digest_responds_to_either_repository(self) -> None:
         run_dir = self.initialize()
@@ -205,7 +332,8 @@ class MultiRepoV7Test(unittest.TestCase):
         (self.backend / "dependency" / "auth.py").write_text("changed\n", encoding="utf-8")
         result = self.call(HARNESS, "init", "--scope", "backend", "--repo", str(self.backend),
                            "--review-mode", "immediate", "--mode-reference", "answer",
-                           "--review-depth", "light", "--risk-reason", "small change",
+                           "--review-depth", "light", "--risk-level", "low",
+                           "--risk-reason", "small change",
                            "--work-item", "auth-check", success=False)
         self.assertIn("changed submodule", result.stderr)
 
@@ -221,7 +349,8 @@ class MultiRepoV7Test(unittest.TestCase):
                        check=True, capture_output=True)
         result = self.call(HARNESS, "init", "--scope", "backend", "--repo", str(self.backend),
                            "--review-mode", "immediate", "--mode-reference", "answer",
-                           "--review-depth", "light", "--risk-reason", "small change",
+                           "--review-depth", "light", "--risk-level", "low",
+                           "--risk-reason", "small change",
                            "--work-item", "submodule-removal", success=False)
         self.assertIn("changed submodule", result.stderr)
 
@@ -239,7 +368,8 @@ class MultiRepoV7Test(unittest.TestCase):
             path.write_text("changed\n", encoding="utf-8")
             result = self.call(HARNESS, "init", "--scope", "backend", "--repo", str(self.backend),
                                "--review-mode", "immediate", "--mode-reference", "answer",
-                               "--review-depth", "light", "--risk-reason", "small change",
+                               "--review-depth", "light", "--risk-level", "low",
+                               "--risk-reason", "small change",
                                "--work-item", f"risk-{path.name}", success=False)
             self.assertIn("high-risk path", result.stderr)
             path.write_text("original\n", encoding="utf-8")
@@ -252,7 +382,8 @@ class MultiRepoV7Test(unittest.TestCase):
         subprocess.run(["git", "-C", str(fresh), "add", "note.txt"], check=True)
         result = self.call(HARNESS, "init", "--scope", "backend", "--repo", str(fresh),
                            "--review-mode", "immediate", "--mode-reference", "answer",
-                           "--review-depth", "light", "--risk-reason", "small local note",
+                           "--review-depth", "light", "--risk-level", "low",
+                           "--risk-reason", "small local note",
                            "--work-item", "fresh-note")
         run_dir = Path(result.stdout.strip())
         self.assertTrue(run_dir.exists())

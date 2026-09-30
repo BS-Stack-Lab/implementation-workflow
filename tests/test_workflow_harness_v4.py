@@ -52,10 +52,14 @@ class WorkflowHarnessV4Test(unittest.TestCase):
     def initialize(self, *, criteria: tuple[str, ...] = ("R1", "R2", "R3")) -> None:
         self.call("init", "--repo", str(self.repo), "--scope", "frontend",
                   "--review-mode", "immediate", "--mode-reference", "answer for this request",
+                  "--risk-level", "low", "--risk-reason", "legacy fixture",
                   "--run-dir", str(self.run_dir))
         state = json.loads((self.run_dir / "state.json").read_text(encoding="utf-8"))
         # Exercise compatibility with runs created before v5 became the default.
         state["version"] = 4
+        state["policy_version"] = 1
+        state.pop("risk_level", None)
+        state.pop("risk_reason", None)
         (self.run_dir / "state.json").write_text(json.dumps(state), encoding="utf-8")
         self.assertEqual(state["version"], 4)
         self.write("frontend-design.md", "# Design\n\n## 수용 기준\n\n" +
@@ -278,6 +282,9 @@ class WorkflowHarnessV4Test(unittest.TestCase):
                   "--run-dir", str(self.run_dir))
         state = json.loads((self.run_dir / "state.json").read_text(encoding="utf-8"))
         state["version"] = 4
+        state["policy_version"] = 1
+        state.pop("risk_level", None)
+        state.pop("risk_reason", None)
         (self.run_dir / "state.json").write_text(json.dumps(state), encoding="utf-8")
         for area in ("frontend", "backend"):
             self.write(f"{area}-design.md", "# Design\n\n## 수용 기준\n\nR1. behavior\n")

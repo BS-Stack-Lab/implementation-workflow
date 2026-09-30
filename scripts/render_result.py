@@ -6,6 +6,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import re
 import sys
 import uuid
 from pathlib import Path
@@ -43,6 +44,9 @@ def validate(run_dir: Path, raw_path: str) -> tuple[dict, str, str]:
         raise ValueError("result focus or outcome does not match slot")
     if not isinstance(data.get("agent_id"), str) or not data["agent_id"].strip():
         raise ValueError("result needs an agent ID")
+    if state.get("policy_version", 1) >= 3 and stage in {"design-review", "code-review"} \
+            and data.get("risk_level") not in {"low", "medium", "high", "unknown"}:
+        raise ValueError(f"policy v3 {stage} needs an explicit risk_level")
     findings = data.get("findings")
     references = data.get("evidence")
     if not isinstance(findings, list) or not isinstance(references, list):
@@ -83,8 +87,10 @@ def requires_test_code_assessment(state: dict, run_dir: Path | None = None) -> b
     run_id = state.get("run_id")
     if not isinstance(run_id, str):
         raise ValueError("v8 run needs a string run_id")
-    versioned_run_id = run_id.startswith("v8p2-")
-    if (versioned_run_id and policy_version != 2) or (policy_version >= 2 and not versioned_run_id):
+    match = re.match(r"^v8p([0-9]+)-", run_id)
+    versioned_policy = int(match.group(1)) if match else None
+    if (versioned_policy is not None and versioned_policy != policy_version) \
+            or (policy_version >= 2 and versioned_policy is None):
         raise ValueError("v8 run identity does not match its initialized policy version")
     if run_dir is not None:
         marker_path = run_dir / "run-policy.json"
@@ -179,7 +185,10 @@ def validate_test_code_assessment(run_dir: Path, state: dict, data: dict) -> Non
 def markdown(data: dict) -> str:
     lines = [f"# {data['stage']} {data['area']} slot {data['slot']}", "",
              f"- agent_id: `{data['agent_id']}`", f"- focus: `{data['focus']}`",
-             f"- result: **{data['result']}**", "", "## Findings", ""]
+             f"- result: **{data['result']}**"]
+    if "risk_level" in data:
+        lines.append(f"- risk_level: **{data['risk_level']}**")
+    lines += ["", "## Findings", ""]
     if not data["findings"]:
         lines.append("- None")
     for finding in data["findings"]:
