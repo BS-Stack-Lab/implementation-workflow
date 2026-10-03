@@ -80,10 +80,14 @@ def risk_guard(state: dict, run_dir: Path | None = None) -> None:
             raise ValueError("policy v3 run needs an explicit risk level")
         if not str(state.get("risk_reason", "")).strip():
             raise ValueError("policy v3 run needs risk evidence")
-        if depth == "light" and (state["scope"] == "both" or risk != "low"):
-            raise ValueError("light review needs a low-risk single-area run")
-        if depth == "balanced" and (state["scope"] != "both" or risk not in {"low", "medium"}):
-            raise ValueError("balanced review needs a low/medium two-area run")
+        if depth == "light" and (state["scope"] == "both" or risk != "low"
+                                  or (state.get("policy_version", 1) >= 4
+                                      and state.get("task_size") != "small")):
+            raise ValueError("light review needs a low-risk small single-area run")
+        balanced_scope_invalid = (state["scope"] != "both" if state.get("policy_version", 1) < 4
+                                  else state.get("task_size") != "medium")
+        if depth == "balanced" and (balanced_scope_invalid or risk not in {"low", "medium"}):
+            raise ValueError("balanced review needs a medium single-area or low/medium two-area run")
         if depth not in {"light", "balanced", "full"}:
             raise ValueError("unsupported policy v3 review profile")
         assessments = []
@@ -271,13 +275,73 @@ def read_state(run_dir: Path) -> dict:
     if state["version"] >= 6 and state.get("review_depth") not in allowed_depths:
         raise ValueError("v6 run needs a review depth")
     policy_version = state.get("policy_version", 1)
-    if type(policy_version) is not int or policy_version not in {1, 2, 3}:
+    if type(policy_version) is not int or policy_version not in {1, 2, 3, 4}:
         raise ValueError("unsupported workflow policy version")
     if policy_version >= 2 and not str(state.get("run_id", "")).startswith(f"v8p{policy_version}-"):
         raise ValueError("workflow run ID does not match its policy version")
     if policy_version < 3 and state.get("review_depth") == "balanced":
         raise ValueError("balanced profile is unavailable before policy v3")
+    if policy_version >= 4:
+        if state.get("task_size") not in {"small", "medium", "large"}:
+            raise ValueError("policy v4 run needs a task size")
+        validate_scope_contract(run_dir, state)
     return state
+
+
+def validate_scope_contract(run_dir: Path, state: dict) -> dict:
+    path = run_dir / "scope-contract.json"
+    if path.is_symlink() or not path.is_file():
+        raise ValueError("policy v4 run needs a local scope-contract.json")
+    contract = json.loads(path.read_text(encoding="utf-8"))
+    fields = ("goal", "in_scope", "out_of_scope", "completion_criteria")
+    if not isinstance(contract, dict) or contract.get("schema_version") != 1 \
+            or contract.get("request_id") != state.get("run_id") \
+            or contract.get("owner_role") != "coordinator" \
+            or any(not isinstance(contract.get(key), str) or not contract[key].strip()
+                   for key in fields):
+        raise ValueError("scope contract is incomplete or does not match this run")
+    expected = state.get("scope_contract_digest")
+    actual = hashlib.sha256(serialized_json(contract)).hexdigest()
+    if not isinstance(expected, str) or expected != actual:
+        raise ValueError("scope contract changed after initialization; start a new run")
+    marker_path = run_dir / "run-policy.json"
+    if marker_path.is_symlink() or not marker_path.is_file():
+        raise ValueError("policy v4 run needs its initialization marker")
+    marker = json.loads(marker_path.read_text(encoding="utf-8"))
+    if marker != run_policy_data(state["run_id"], 4, expected):
+        raise ValueError("scope contract initialization marker does not match")
+    return contract
+
+
+def guard_task_paths(run_dir: Path, state: dict, task_paths: list[str]) -> list[str]:
+    register = scope_register(run_dir, state)
+    normalized = []
+    for raw in task_paths:
+        path = Path(raw)
+        if path.is_absolute() or "\\" in raw or any(part in {"", ".", ".."} for part in raw.split("/")):
+            raise ValueError("task paths must be safe repository-relative paths")
+        normalized.append(raw.casefold().rstrip("/"))
+    blocked = []
+    for question in register["questions"]:
+        if question["kind"] != "required_decision" or question["status"] != "pending":
+            continue
+        dependencies = []
+        for raw in question.get("dependent_paths", []):
+            path = Path(raw)
+            if path.is_absolute() or "\\" in raw or any(
+                    part in {"", ".", ".."} for part in raw.split("/")):
+                blocked.append(question["id"])
+                dependencies = []
+                break
+            dependencies.append(raw.casefold().rstrip("/"))
+        if not dependencies:
+            blocked.append(question["id"])
+            continue
+        if any(task == dependency or task.startswith(dependency + "/")
+               or dependency.startswith(task + "/")
+               for task in normalized for dependency in dependencies):
+            blocked.append(question["id"])
+    return blocked
 
 
 def write_state(run_dir: Path, state: dict) -> None:
@@ -594,7 +658,10 @@ def plans(run_dir: Path, state: dict) -> tuple[dict, dict]:
                 covered.add(scenario["criterion_id"])
         if slots != expected_slots:
             raise ValueError(f"QA plan needs slots {sorted(expected_slots)}: {area}")
-        if state["version"] >= 6 and {item["kind"] for item in scenarios} != QA_KINDS:
+        required_kinds = ({"normal", "regression"}
+                          if state.get("policy_version", 1) >= 4
+                          and review_depth(state) == "light" else QA_KINDS)
+        if state["version"] >= 6 and not required_kinds <= {item["kind"] for item in scenarios}:
             raise ValueError(f"v6 QA plan needs all five scenario kinds: {area}")
         if area != "integration" and covered != criteria[area]:
             raise ValueError(f"QA plan does not cover every criterion: {area}")
@@ -629,6 +696,8 @@ def plan_digests(run_dir: Path, state: dict | None = None) -> dict[str, str]:
         names.append("impact-map.json")
     if state is not None and state.get("version", 0) >= 8:
         names.append("official-sources.json")
+    if state is not None and state.get("policy_version", 1) >= 4:
+        names.extend(("scope-contract.json", "run-policy.json"))
     digests = {name: artifact_digest(run_dir, name) for name in names}
     if state is not None and state.get("required_plan_baseline"):
         payload = json.dumps(state["required_plan_baseline"], sort_keys=True,
@@ -961,8 +1030,11 @@ def serialized_json(value: dict) -> bytes:
     return (json.dumps(value, ensure_ascii=False, indent=2) + "\n").encode("utf-8")
 
 
-def run_policy_data(run_id: str, policy_version: int) -> dict:
+def run_policy_data(run_id: str, policy_version: int,
+                    scope_contract_digest: str | None = None) -> dict:
     body = {"schema_version": 1, "run_id": run_id, "policy_version": policy_version}
+    if scope_contract_digest is not None:
+        body["scope_contract_digest"] = scope_contract_digest
     return {**body, "digest": hashlib.sha256(serialized_json(body)).hexdigest()}
 
 
@@ -990,7 +1062,7 @@ def recover_file_transaction(run_dir: Path, journal_name: str, expected_targets:
             or not isinstance(journal.get("files"), list):
         raise ValueError(f"invalid {label} recovery journal")
     if label == "report publication" and journal["schema_version"] == 2 \
-            and journal.get("policy_version") not in {2, 3}:
+            and journal.get("policy_version") not in {2, 3, 4}:
         raise ValueError("unsupported report publication policy version")
     if {item.get("target") for item in journal["files"] if isinstance(item, dict)} != expected_targets:
         raise ValueError(f"{label} journal has an unexpected target")
@@ -1251,7 +1323,8 @@ def publish_report(run_dir: Path, state: dict, draft_path: Path) -> tuple[str, s
     content = draft_abs.read_text(encoding="utf-8")
     sources = validate_official_sources(run_dir) if state["version"] >= 8 else None
     register = scope_register_data(state) if state["version"] >= 8 else {"questions": []}
-    pending = [question for question in register["questions"] if question["status"] == "pending"]
+    pending = [question for question in register["questions"] if question["status"] == "pending"
+               and state.get("policy_version", 1) < 4]
     if pending:
         ids = ", ".join(question["id"] for question in pending)
         raise ValueError("pending user questions must be answered or declined before report publication: " + ids)
@@ -1264,7 +1337,13 @@ def publish_report(run_dir: Path, state: dict, draft_path: Path) -> tuple[str, s
                       ".ts", ".tsx"}}
     validate_report_sections(content, changed, changed_lines, state.get("base_commits", {}))
     hook_conflicts = hook_path_conflicts(state)
-    status = "incomplete" if unresolved_required_decisions(register) else "complete"
+    required_pending = [q for q in register["questions"]
+                        if q["kind"] == "required_decision" and q["status"] == "pending"]
+    blocked_design = any(event.get("type") == "design-blocked"
+                         and event.get("digest") == design_digest(run_dir, event["area"])
+                         for event in state.get("events", []))
+    status = "incomplete" if blocked_design or unresolved_required_decisions(register) or (
+        state.get("policy_version", 1) >= 4 and required_pending) else "complete"
     lines = [content.rstrip(), "", "## 실행 상태", "", f"- status: **{status}**", ""]
     if hook_conflicts:
         lines += ["## 로컬 문서 guard 훅 설정", "",
@@ -1281,6 +1360,12 @@ def publish_report(run_dir: Path, state: dict, draft_path: Path) -> tuple[str, s
                    ", ".join(question["paths"]), question["impact"])
             lines.append("| " + " | ".join(markdown_cell(str(value)) for value in row) + " |")
         lines.append("")
+        if state.get("policy_version", 1) >= 4:
+            deferred = [q["id"] for q in register["questions"]
+                        if q["kind"] == "scope_extension" and q["status"] == "pending"]
+            if deferred:
+                lines += ["요청 범위 밖 선택 질문은 응답이 없어 후속 작업으로 보류했습니다: "
+                          + ", ".join(deferred) + ".", ""]
     if sources and sources.get("status") == "applicable":
         lines += ["## 공식 문서 근거", ""]
         for source in sources["sources"]:
@@ -1729,6 +1814,16 @@ def check_reviews_v3(run_dir: Path, state: dict) -> None:
 
     for area in review_areas(state["scope"]):
         digest = design_digest(run_dir, area)
+        if state.get("policy_version", 1) >= 4:
+            digests = list(dict.fromkeys(event.get("digest") for event in state["events"]
+                                         if event.get("type") == "review" and event.get("area") == area))
+            if digest not in digests or len(digests) > 2 or digests.index(digest) > 1:
+                raise ValueError(f"design review limit reached; start a new run: {area}")
+            current_round = digests.index(digest) + 1
+            for event in state["events"]:
+                if event.get("type") == "review" and event.get("area") == area \
+                        and event.get("digest") == digest and event.get("review_round") != current_round:
+                    raise ValueError(f"design review round does not match digest history: {area}")
         latest = latest_slot_results(state, "review", area, digest)
         if any(event["result"] != "clear" for event in latest.values()):
             raise ValueError(f"current design needs {len(required_slots(state))} clear review(s): {area}")
@@ -1890,6 +1985,23 @@ def check_v4_cases(run_dir: Path, state: dict, area: str, slot: int | None = Non
 
 
 def check_final_v4(run_dir: Path, state: dict) -> None:
+    if state.get("policy_version", 1) >= 4:
+        blocked = next((event for event in reversed(state.get("events", []))
+                        if event.get("type") == "design-blocked"
+                        and event.get("digest") == design_digest(run_dir, event["area"])), None)
+        if blocked:
+            require_artifact(run_dir, "final-report.md")
+            report_digest = hashlib.sha256((run_dir / "final-report.md").read_bytes()).hexdigest()
+            expected_binding = dict(current_binding(run_dir, state))
+            expected_binding["questions"] = hashlib.sha256(
+                (run_dir / "scope-register.json").read_bytes()).hexdigest()
+            if not any(event.get("type") == "report-published"
+                       and event.get("status") == "incomplete"
+                       and event.get("binding") == expected_binding
+                       and event.get("report_digest") == report_digest
+                       for event in state.get("events", [])):
+                raise ValueError("design-blocked run needs an incomplete report")
+            return
     check_design(run_dir, state)
     require_design_gate(run_dir, state)
     for area in areas_for(state["scope"]):
@@ -1908,7 +2020,10 @@ def check_final_v4(run_dir: Path, state: dict) -> None:
     verify_all_evidence(run_dir, state)
     if state["version"] >= 8:
         register = scope_register(run_dir, state)
-        if any(question["status"] == "pending" for question in register["questions"]):
+        if any(question["status"] == "pending"
+               and not (state.get("policy_version", 1) >= 4
+                        and question["kind"] in {"scope_extension", "required_decision"})
+               for question in register["questions"]):
             raise ValueError("pending user questions must be answered or declined before final completion")
         if unresolved_required_decisions(register):
             ids = ", ".join(question["id"] for question in unresolved_required_decisions(register))
@@ -1918,9 +2033,12 @@ def check_final_v4(run_dir: Path, state: dict) -> None:
         report_binding = dict(current_binding(run_dir, state))
         report_binding["questions"] = hashlib.sha256(
             (run_dir / "scope-register.json").read_bytes()).hexdigest()
+        expected_report_status = "incomplete" if unresolved_required_decisions(register) or any(
+            q["kind"] == "required_decision" and q["status"] == "pending"
+            for q in register["questions"]) else "complete"
         if not any(event.get("type") == "report-published"
                    and event.get("run_id") == state["run_id"]
-                   and event.get("status") == "complete"
+                   and event.get("status") == expected_report_status
                    and event.get("binding") == report_binding
                    and event.get("report_digest") == report_digest
                    for event in state["events"]):
@@ -1974,6 +2092,10 @@ def completed_run(run_dir: Path, state: dict) -> bool:
     if state.get("version", 0) < 7:
         return False
     try:
+        latest_report = next((event for event in reversed(state.get("events", []))
+                              if event.get("type") == "report-published"), None)
+        if latest_report and latest_report.get("status") == "incomplete":
+            return False
         binding = current_binding(run_dir, state)
         if not any(event.get("type") == "final-gate-passed"
                    and event.get("binding") == binding for event in state["events"]):
@@ -2095,6 +2217,29 @@ def workflow_status(run_dir: Path, state: dict) -> dict:
     if superseded:
         return {"stage": "superseded", "next_action": "continue-superseding-run",
                 "blocker": f"superseded by {superseded.get('superseded_by')}", "complete": False}
+    if state.get("policy_version", 1) >= 4:
+        blocked = next((event for event in reversed(state.get("events", []))
+                        if event.get("type") == "design-blocked"
+                        and event.get("digest") == design_digest(run_dir, event["area"])), None)
+        if blocked:
+            report = run_dir / "final-report.md"
+            report_binding = dict(current_binding(run_dir, state))
+            report_binding["questions"] = hashlib.sha256(
+                (run_dir / "scope-register.json").read_bytes()).hexdigest()
+            report_digest = hashlib.sha256(report.read_bytes()).hexdigest() if report.is_file() else None
+            published = any(event.get("type") == "report-published"
+                            and event.get("run_id") == state["run_id"]
+                            and event.get("status") == "incomplete"
+                            and event.get("binding") == report_binding
+                            and event.get("report_digest") == report_digest
+                            for event in state.get("events", []))
+            if published:
+                return {"stage": "incomplete", "next_action": "start-new-run",
+                        "blocker": "design review limit reached; see incomplete report",
+                        "complete": False}
+            return {"stage": "report", "next_action": "write-incomplete-report",
+                    "blocker": "second design review still has blocking findings",
+                    "complete": False}
     if (state.get("version", 0) < 7 and legacy_run_complete(run_dir, state)) or completed_run(run_dir, state):
         return {"stage": "complete", "next_action": "none", "blocker": None, "complete": True}
     for area in review_areas(state["scope"]):
@@ -2149,7 +2294,9 @@ def workflow_status(run_dir: Path, state: dict) -> dict:
     if state.get("version", 0) >= 8:
         try:
             register = scope_register(run_dir, state)
-            pending = [question for question in register["questions"] if question["status"] == "pending"]
+            pending = [question for question in register["questions"] if question["status"] == "pending"
+                       and not (state.get("policy_version", 1) >= 4
+                                and question["kind"] == "scope_extension")]
             if pending:
                 ids = ", ".join(question["id"] for question in pending)
                 return {"stage": "awaiting-user", "next_action": "answer-question",
@@ -2159,14 +2306,24 @@ def workflow_status(run_dir: Path, state: dict) -> dict:
             current_questions = hashlib.sha256((run_dir / "scope-register.json").read_bytes()).hexdigest()
             report_binding = dict(current_binding(run_dir, state))
             report_binding["questions"] = current_questions
-            if unresolved and any(event.get("type") == "report-published"
-                                  and event.get("status") == "incomplete"
-                                  and event.get("binding") == report_binding
-                                  and event.get("report_digest") == hashlib.sha256(
-                                      (run_dir / "final-report.md").read_bytes()).hexdigest()
-                                  for event in state["events"]):
-                return {"stage": "incomplete", "next_action": "resolve-required-decision",
-                        "blocker": "required decisions remain declined or unanswered",
+            matching_report = next((event for event in reversed(state["events"])
+                                    if event.get("type") == "report-published"
+                                    and event.get("binding") == report_binding
+                                    and event.get("report_digest") == hashlib.sha256(
+                                        (run_dir / "final-report.md").read_bytes()).hexdigest()), None)
+            if matching_report and matching_report.get("status") == "incomplete":
+                return {"stage": "incomplete", "next_action": (
+                            "answer-question" if any(q["status"] == "pending" for q in pending)
+                            else "resolve-required-decision"),
+                        "blocker": "required decision or design review is incomplete",
+                        "complete": False}
+            if (unresolved or (state.get("policy_version", 1) >= 4
+                               and any(q["status"] == "pending" for q in pending))) \
+                    and matching_report:
+                return {"stage": "incomplete", "next_action": (
+                            "answer-question" if any(q["status"] == "pending" for q in pending)
+                            else "resolve-required-decision"),
+                        "blocker": "required decisions remain pending, declined, or unanswered",
                         "complete": False}
         except (OSError, ValueError, KeyError, json.JSONDecodeError):
             pass
@@ -2197,6 +2354,12 @@ def main() -> int:
     initialize.add_argument("--review-depth", choices=("light", "balanced", "full"))
     initialize.add_argument("--risk-level", choices=("low", "medium", "high", "unknown"))
     initialize.add_argument("--risk-reason", default="")
+    initialize.add_argument("--policy-version", type=int, choices=(3, 4), default=3)
+    initialize.add_argument("--task-size", choices=("small", "medium", "large"))
+    initialize.add_argument("--scope-goal")
+    initialize.add_argument("--in-scope")
+    initialize.add_argument("--out-of-scope")
+    initialize.add_argument("--completion-criterion")
     initialize.add_argument("--run-dir", type=Path)
     initialize.add_argument("--parent-dir", type=Path,
                             help="Existing branch or work folder under ~/Documents/docs")
@@ -2207,7 +2370,7 @@ def main() -> int:
     for command in ("present", "review", "approve", "accept-design", "agent-result", "resolve-agent",
                     "check-record", "resolve-check", "qa-case", "resolve-qa-case",
                     "scope-question", "scope-answer", "report-publish", "check", "status",
-                    "timing-start", "timing-finish", "timing-summary"):
+                    "task-guard", "timing-start", "timing-finish", "timing-summary"):
         sub = commands.add_parser(command)
         sub.add_argument("--run-dir", type=Path, required=True)
         if command in {"present", "review", "approve", "agent-result", "resolve-agent", "check-record",
@@ -2280,6 +2443,9 @@ def main() -> int:
             sub.add_argument("--path", action="append", default=[])
             sub.add_argument("--dependent-path", action="append", default=[])
             sub.add_argument("--impact", required=True)
+        elif command == "task-guard":
+            sub.add_argument("--path", action="append", required=True,
+                             help="Repository-relative path assigned to the next task")
         elif command == "scope-answer":
             sub.add_argument("--question-id", required=True)
             sub.add_argument("--run-id", required=True)
@@ -2364,7 +2530,14 @@ def main() -> int:
             if not args.scope:
                 raise ValueError("a new run or work-item resume needs --scope")
             review_depth_value = args.review_depth or "full"
-            policy_version = 3
+            policy_version = args.policy_version
+            if policy_version >= 4:
+                required_contract = (args.scope_goal, args.in_scope, args.out_of_scope,
+                                     args.completion_criterion)
+                if any(not value or not value.strip() for value in required_contract):
+                    raise ValueError("policy v4 init needs scope goal, in-scope, out-of-scope, and completion criterion")
+                if args.task_size is None:
+                    raise ValueError("policy v4 init needs --task-size")
             selected_risk_level = args.risk_level or "unknown"
             selected_risk_reason = args.risk_reason.strip() or "risk was not classified; full review is required"
             if review_depth_value == "balanced" and policy_version < 3:
@@ -2375,6 +2548,15 @@ def main() -> int:
                 raise ValueError("an explicit --risk-level needs --risk-reason")
             if args.scope == "both" and review_depth_value == "light":
                 raise ValueError("light review needs one area and a risk reason")
+            if policy_version >= 4 and review_depth_value == "light" \
+                    and (args.task_size != "small" or selected_risk_level != "low"):
+                raise ValueError("light review requires a low-risk small task")
+            if policy_version >= 4 and review_depth_value == "balanced" \
+                    and (args.task_size != "medium"
+                         or not ((args.scope != "both" and args.task_size == "medium"
+                                  and selected_risk_level in {"low", "medium"})
+                                 or (args.scope == "both" and selected_risk_level in {"low", "medium"}))):
+                raise ValueError("balanced review requires medium-sized work and low/medium risk")
             if args.scope == "both":
                 if args.repo and not args.frontend_repo and not args.backend_repo:
                     selected = {"frontend": args.repo, "backend": args.repo}
@@ -2497,6 +2679,14 @@ def main() -> int:
                          "review_mode": args.review_mode, "mode_reference": args.mode_reference,
                          "review_depth": review_depth_value,
                          "risk_reason": selected_risk_reason, "events": []}
+                if policy_version >= 4:
+                    state["task_size"] = args.task_size
+                    contract = {"schema_version": 1, "request_id": state["run_id"],
+                                "goal": args.scope_goal.strip(), "in_scope": args.in_scope.strip(),
+                                "out_of_scope": args.out_of_scope.strip(),
+                                "completion_criteria": args.completion_criterion.strip(),
+                                "owner_role": "coordinator"}
+                    state["scope_contract_digest"] = hashlib.sha256(serialized_json(contract)).hexdigest()
                 if policy_version >= 3:
                     state["risk_level"] = selected_risk_level
                 if parent_state is not None:
@@ -2518,10 +2708,13 @@ def main() -> int:
                     write_state(staging_dir, state)
                     write_json_atomic(staging_dir / "official-sources.json",
                                       {"schema_version": 1, "status": "pending", "sources": []})
+                    if policy_version >= 4:
+                        write_json_atomic(staging_dir / "scope-contract.json", contract)
                     write_json_atomic(staging_dir / "scope-register.json",
                                       {"schema_version": 1, "questions": []})
                     write_json_atomic(staging_dir / "run-policy.json",
-                                      run_policy_data(state["run_id"], state["policy_version"]))
+                                      run_policy_data(state["run_id"], state["policy_version"],
+                                                      state.get("scope_contract_digest")))
                     if parent_state is not None:
                         supersede_journal = parent / f".workflow-supersede-{state['run_id']}.json"
                         write_json_atomic(supersede_journal, {
@@ -2665,12 +2858,19 @@ def main() -> int:
             return 0
         if args.command in {"scope-question", "scope-answer", "report-publish"} and state["version"] < 8:
             raise ValueError("scope tracking and atomic report publishing require a migrated v8 run")
+        if args.command == "task-guard":
+            blocked = guard_task_paths(run_dir, state, args.path)
+            print(json.dumps({"allowed": not blocked, "blocked_by": blocked}, ensure_ascii=False))
+            return 3 if blocked else 0
         if args.command == "scope-question":
             register = scope_register(run_dir, state)
             if any(item["id"] == args.question_id for item in register["questions"]):
                 raise ValueError("scope question ID must be unique")
             if not args.question.strip() or not args.impact.strip():
                 raise ValueError("scope question and impact cannot be empty")
+            if state.get("policy_version", 1) >= 4 and args.kind == "required_decision" \
+                    and not args.dependent_path:
+                raise ValueError("policy v4 required decisions need at least one --dependent-path")
             question = {"id": args.question_id, "kind": args.kind, "status": "pending",
                         "question": args.question.strip(), "paths": args.path,
                         "dependent_paths": args.dependent_path, "impact": args.impact.strip(),
@@ -2749,6 +2949,28 @@ def main() -> int:
                     raise ValueError("design review requires --slot and --agent-id")
                 if state["version"] >= 4 and args.focus != focus_for("design-review", args.area, args.slot, review_depth(state)):
                     raise ValueError("design review focus does not match slot")
+                design_hash = design_digest(run_dir, args.area)
+                review_history = list(dict.fromkeys(event.get("digest") for event in state["events"]
+                                                    if event.get("type") == "review"
+                                                    and event.get("area") == args.area))
+                if state.get("policy_version", 1) >= 4:
+                    if design_hash not in review_history and len(review_history) >= 2:
+                        raise ValueError("design review limit reached; start a new run")
+                    if design_hash not in review_history and review_history:
+                        old_digest = review_history[-1]
+                        old_findings = [index for index, item in enumerate(state["events"])
+                                        if item.get("type") == "review" and item.get("area") == args.area
+                                        and item.get("digest") == old_digest
+                                        and item.get("result") == "changes-required"]
+                        if not old_findings:
+                            raise ValueError("a second design digest is only allowed after approved blocking findings")
+                        if any(not approved_finding(run_dir, state, args.area, index)
+                               for index in old_findings):
+                            raise ValueError("approve all initial design findings before the one revision review")
+                    if any(item.get("type") == "review" and item.get("area") == args.area
+                           and item.get("digest") == design_hash and item.get("slot") == args.slot
+                           for item in state["events"]):
+                        raise ValueError("review slot already submitted for this design round")
                 if state["version"] >= 4:
                     plans(run_dir, state)
                 if state.get("policy_version", 1) >= 3 and args.risk_level is None:
@@ -2756,8 +2978,11 @@ def main() -> int:
                 review_file = agent_artifact("design-review", args.area, args.slot)
                 event = {"type": "review", "area": args.area, "slot": args.slot,
                                         "agent_id": args.agent_id.strip(), "result": args.result,
-                                        "finding": args.finding, "digest": design_digest(run_dir, args.area),
+                                        "finding": args.finding, "digest": design_hash,
                                         "artifact_digest": artifact_digest(run_dir, review_file)}
+                if state.get("policy_version", 1) >= 4:
+                    event["review_round"] = (review_history.index(design_hash) + 1
+                                              if design_hash in review_history else len(review_history) + 1)
                 if state.get("policy_version", 1) >= 3:
                     event["risk_level"] = args.risk_level
                 if state["version"] >= 4:
@@ -2774,6 +2999,20 @@ def main() -> int:
                     event.update(model_selection(args.model, args.effort, args.model_reason))
                     event.update(context_selection(args.context_mode, args.context_reason))
                 state["events"].append(event)
+                if state.get("policy_version", 1) >= 4 and event["review_round"] == 2:
+                    latest_round = [item for item in state["events"]
+                                    if item.get("type") == "review" and item.get("area") == args.area
+                                    and item.get("digest") == design_hash]
+                    latest_by_slot = {item["slot"]: item for item in latest_round}
+                    if set(latest_by_slot) == set(required_slots(state)) \
+                            and any(item["result"] == "changes-required" for item in latest_by_slot.values()):
+                        state["events"].append({"type": "design-blocked", "area": args.area,
+                                                "digest": design_hash, "review_round": 2,
+                                                "finding_indexes": [index for index, item in enumerate(state["events"])
+                                                                    if item.get("type") == "review"
+                                                                    and item.get("area") == args.area
+                                                                    and item.get("digest") == design_hash
+                                                                    and item.get("result") == "changes-required"]})
             else:
                 review_file = f"{args.area}-design-review.md" if args.area != "integration" else "integration-contract-review.md"
                 require_artifact(run_dir, review_file)

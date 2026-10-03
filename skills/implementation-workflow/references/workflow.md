@@ -10,9 +10,12 @@
 6. 요청과 실제 변경 범위를 프론트엔드, 백엔드, 두 영역 모두 중 하나로 판별한다. 관련 없는 영역의 설계·검토·테스트·QA 문서는 만들지 않는다.
 7. 매 새로운 구현 요청마다 사용자에게 설계 문서 작성 후 독립 검토가 끝나면 바로 구현할지, 직접 설계를 검토한 뒤 구현할지 반드시 묻는다. 사용할 수 있는 질문 UI에서 선택지와 자유 입력을 제공한다. 이전 요청의 선택을 재사용하지 않으며 이번 요청에 대한 명시적 답변 전에는 구현 방식을 추정하지 않는다.
 8. `~/Documents/docs/`에서 현재 저장소·브랜치·작업에 쓰는 기존 폴더를 확인한다. 자동 생성된 동일 작업 폴더는 `--work-item`으로 재사용한다. 사람이 만든 기존 폴더가 현재 작업의 것임을 확인했다면 `--parent-dir`로 지정하고, 후보가 모호하면 질문 UI로 선택을 묻는다. 선택한 범위와 검토 방식의 오케스트라 작업 그래프를 출력하고 하네스를 초기화해 해당 폴더 아래 새 실행 폴더를 만든다.
-9. 요청 범위 밖의 개선은 `scope_extension`, 원 요청에 답이 꼭 필요한 결정은 `required_decision`으로 질문·기록한다. 모든 질문은 유효한 명시 응답 또는 거절이 올 때까지 pending 상태와 같은 ID·revision을 유지한다. pending 질문이 있어도 종속되지 않은 구현·검사·리뷰·QA는 계속한다. 모든 필수 게이트가 끝나 report 단계에 도달했을 때 `status`가 `awaiting-user/answer-question`을 반환하면 질문 UI를 표시하고 호스트가 현재 turn을 유지하는 동안 최대 60초 단위로 응답을 기다린다. 대기 반복은 turn 종료·앱 종료 뒤 UI가 남는다는 보장이 아니며, 중단 후 재개하면 같은 ID·revision으로 다시 표시한다. 무관한 입력·모호한 답은 pending을 해제하지 않는다. 응답을 기록하기 전 `report-publish`를 호출하지 않는다. pending 질문의 `report-publish`는 상태·파일을 바꾸지 않고 실패한다. 구버전 자동 unanswered 게시 transaction을 복구할 때는 질문을 pending으로 되돌리고 게시물을 `final-report-interrupted-*.md`로 보존한다.
-10. 위험을 `low|medium|high|unknown`으로 평가한다. 위험을 정하지 않은 신규 실행은 `unknown/full`이다. 단일 영역 low는 `light`, 양 영역 low/medium은 `balanced`, 나머지는 `full`을 사용한다. 사용자는 low/medium에서도 full을 선택할 수 있다. 코디네이터·설계 검토자·코드 검토자의 위험 판단 중 가장 높은 것을 적용하고, 현재 프로필 범위를 넘으면 필수 계획을 상속한 새 full 실행을 만든다. `balanced`는 역할별 1명, `full`은 서로 다른 3명을 둔다. 짧은 브리프와 병렬 wave 실행으로 대기 시간을 줄이되 timeout이나 검토 미완료를 PASS로 취급하지 않는다.
-11. 사용 중인 기술 버전의 공식 공급자 문서/API 레퍼런스를 확인하고 `official-sources.json`에 근거와 적용 코드 경로를 남긴다. 적용 가능한 출처가 검토되지 않았다면 구현 단계로 넘어가지 않는다.
+9. 요청 범위 밖의 개선은 `scope_extension`, 원 요청에 답이 꼭 필요한 결정은 `required_decision`으로 질문·기록한다. policy-v4에서 선택 질문은 미응답이어도 핵심 작업과 보고서 게시를 막지 않고 후속 작업 표에 남긴다. 필수 결정은 `dependent_paths`와 작업 경로가 겹치는 작업만 차단한다. 그 밖의 단계는 계속한다. 응답이 끝내 없으면 incomplete 리포트를 게시하고 `complete=false`, `next_action=answer-question`을 반환한다. 같은 ID·revision은 재개 시 복원한다. v2-v3 실행은 기존 pending 질문 규칙을 유지한다. 재개하면 모호한 답으로 pending을 해제하지 않는다.
+10. 신규 policy-v4 실행은 `scope-contract.json`에 원 요청·포함 경로·제외 범위·완료 기준·coordinator owner를 저장하고 계획·리뷰·최종 증거에 hash를 결합한다. coordinator 한 명이 전체 그래프와 상태를 소유한다. 서브에이전트는 배정된 영역과 경로만 다루고 범위 변경은 제안으로 반환한다.
+11. 설계 검토 상한은 초기 검토 1회와 승인된 수정 후 재검토 1회다. 재검토에 blocking finding이 남으면 `design-blocked` incomplete 리포트를 게시하고 새 실행을 안내한다. 세 번째 설계 digest는 거부한다.
+12. 작업 크기·위험으로 프로필을 선택한다: small+low 단일 영역은 light, medium 단일 영역 또는 변경 경로가 분리된 low/medium 양 영역은 balanced, large·high·unknown·고영향 변경은 full이다. 대형 양 영역 변경과 공유 계약/통합 작업은 full이다. light는 단계별 1명과 normal/regression 최소 QA, balanced는 영역별 1명 및 필요한 통합 검증, full은 역할별 서로 다른 3명을 쓴다. 어떤 프로필에서도 설계·필수 검사·코드 검토·QA·리포트 게이트를 생략하지 않는다.
+13. 위험을 `low|medium|high|unknown`으로 평가한다. 위험을 정하지 않은 신규 실행은 `unknown/full`이다. task-size 기준과 앞선 프로필 규칙을 함께 적용한다. 코디네이터·설계 검토자·코드 검토자의 위험 판단 중 가장 높은 것을 적용하고, 현재 프로필 범위를 넘으면 필수 계획을 상속한 새 full 실행을 만든다. 짧은 브리프와 병렬 wave 실행으로 대기 시간을 줄이되 timeout이나 검토 미완료를 PASS로 취급하지 않는다.
+14. 사용 중인 기술 버전의 공식 공급자 문서/API 레퍼런스를 확인하고 `official-sources.json`에 근거와 적용 코드 경로를 남긴다. 적용 가능한 출처가 검토되지 않았다면 구현 단계로 넘어가지 않는다.
 
 완료 기준: 구현 범위, 각 수용 기준과 공식 근거, 사용자가 선택한 검토 방식, 질문할 범위 밖 항목을 추적할 수 있다.
 

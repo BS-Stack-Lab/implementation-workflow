@@ -2,7 +2,7 @@
 
 ## 현재 실행 재개
 
-새 작업을 시작하기 전에 `~/Documents/docs/`에서 같은 작업 ID의 실행 폴더를 찾는다. v8 미완료 실행이면 `scope-register.json`을 먼저 읽고 pending 질문을 같은 ID·revision으로 복원한 다음 `python3 <plugin-root>/scripts/workflow_harness.py status --run-dir <local-run-dir>`로 `stage`, `next_action`, `blocker`, `complete`를 확인한다. v2-v7은 기존 status 우선 재개 절차를 유지한다. 미완료 실행이면 `python3 <plugin-root>/scripts/orchestrate.py --run-dir <local-run-dir>`의 상태와 그래프를 사용해 다음 단계부터 계속한다. 설계 게이트를 통과한 `immediate` 구현 작업을 설계 문서 전달만으로 종료하지 않는다. `user-review`의 설계 확인이나 추가 설계 변경 승인처럼 실제 사용자 응답이 필요한 경우에는 그 응답을 기다린다. 설계만 요청된 작업은 설계 문서를 전달하면 범위가 끝난다.
+새 작업을 시작하기 전에 `~/Documents/docs/`에서 같은 작업 ID의 실행 폴더를 찾는다. policy-v4 미완료 실행이면 `scope-register.json`을 먼저 읽고 pending 질문을 같은 ID·revision으로 복원한 다음 `python3 <plugin-root>/scripts/workflow_harness.py status --run-dir <local-run-dir>`로 `stage`, `next_action`, `blocker`, `complete`를 확인한다. v2-v3은 기존 status 우선 재개 절차를 유지한다. 미완료 실행이면 `python3 <plugin-root>/scripts/orchestrate.py --run-dir <local-run-dir>`의 상태와 그래프를 사용해 다음 단계부터 계속한다. 설계 게이트를 통과한 `immediate` 구현 작업을 설계 문서 전달만으로 종료하지 않는다. `user-review`의 설계 확인이나 추가 설계 변경 승인처럼 실제 사용자 응답이 필요한 경우에는 그 응답을 기다린다. 설계만 요청된 작업은 설계 문서를 전달하면 범위가 끝난다.
 
 신규 실행에서는 `--work-item <작업-ID>`를 지정해 동일 작업의 미완료 실행을 재사용한다. 명시적으로 새 실행을 만들 때는 `--new-run`을 사용한다. 두 영역이 다른 Git 체크아웃에 있으면 `init --scope both --frontend-repo <FE-저장소> --backend-repo <BE-저장소>`를 사용한다. 연동 명령의 작업 디렉터리를 별도로 지정하려면 `--integration-repo <저장소>`를 추가한다. 같은 체크아웃에서 양쪽을 작업하면 두 인수에 같은 루트를 지정한다. 기존 실행 기록은 해당 버전의 방식으로 읽는다.
 
@@ -20,7 +20,7 @@ python3 <plugin-root>/scripts/orchestrate.py --scope backend --review-mode <imme
 python3 <plugin-root>/scripts/orchestrate.py --scope both --review-mode <immediate|user-review>
 ```
 
-매 새로운 구현 요청마다 사용자에게 검토 방식을 물은 뒤 실제 범위에 해당하는 명령 한 가지만 실행한다. 이전 선택을 재사용하지 않는다. `immediate`는 독립 검토 후 진행하고, `user-review`는 작성된 설계를 사용자에게 보여주고 최종 설계 확인을 기다린다. 그래프의 `depends_on`을 지킨다. `light`는 low-risk 단일 영역, `balanced`는 low/medium-risk 양 영역으로 각 설계·코드 검토·QA·계약/연동 담당을 하나씩 배정하고 한 담당자가 자기 영역의 모든 기준·사례를 확인한다. `full`은 각 역할에 서로 다른 세 에이전트를 배정한다. `--include-waves`가 있을 때만 버전 필드와 함께 결정적 `parallel_waves`를 출력한다. wave 내 작업은 큐에 넣되 실제 실행은 가용 슬롯까지만 시작하고, 작업이 끝날 때마다 같은 wave의 대기 항목으로 슬롯을 채운다. 해당 wave가 모두 끝나야 다음 wave로 이동한다. 같은 Git checkout을 쓰는 FE/BE 구현과 그 검토는 경로 선언과 무관하게 직렬화한다. 서로 다른 checkout의 작업만 run-local exact path ownership map이 경로를 단일 영역에 배정하고 공유·겹침·누락·예상 밖 경로가 없을 때 병렬화한다. 실행 후에는 tracked·untracked·삭제·rename 양쪽 경로를 검사하고 계획과 다르면 직렬 통합·재검증한다. 스크립트는 계획을 출력하며 에이전트를 직접 생성하지 않는다. 코디네이터가 가용 슬롯 수에 맞춰 Codex 서브에이전트를 배정하고 wave barrier와 결과 수집을 관리한다.
+매 새로운 구현 요청마다 사용자에게 검토 방식을 물은 뒤 실제 범위에 해당하는 명령 한 가지만 실행한다. 이전 선택을 재사용하지 않는다. `immediate`는 독립 검토 후 진행하고, `user-review`는 작성된 설계를 사용자에게 보여주고 최종 설계 확인을 기다린다. 그래프의 `depends_on`을 지킨다. `light`는 low-risk 단일 영역, `balanced`는 medium 크기의 단일 영역 또는 경로가 분리된 low/medium-risk 양 영역으로 각 설계·코드 검토·QA·계약/연동 담당을 하나씩 배정하고 한 담당자가 자기 영역의 모든 기준·사례를 확인한다. `full`은 각 역할에 서로 다른 세 에이전트를 배정한다. `--include-waves`가 있을 때만 버전 필드와 함께 결정적 `parallel_waves`를 출력한다. wave 내 작업은 큐에 넣되 실제 실행은 가용 슬롯까지만 시작하고, 작업이 끝날 때마다 같은 wave의 대기 항목으로 슬롯을 채운다. 해당 wave가 모두 끝나야 다음 wave로 이동한다. 같은 Git checkout을 쓰는 FE/BE 구현과 그 검토는 경로 선언과 무관하게 직렬화한다. 서로 다른 checkout의 작업만 run-local exact path ownership map이 경로를 단일 영역에 배정하고 공유·겹침·누락·예상 밖 경로가 없을 때 병렬화한다. 실행 후에는 tracked·untracked·삭제·rename 양쪽 경로를 검사하고 계획과 다르면 직렬 통합·재검증한다. 스크립트는 계획을 출력하며 에이전트를 직접 생성하지 않는다. 코디네이터가 가용 슬롯 수에 맞춰 Codex 서브에이전트를 배정하고 wave barrier와 결과 수집을 관리한다.
 
 실행 시간을 비교할 때는 각 대표 작업을 `timing-start --task-id <task> --wave-id <wave> --wave-execution-id <unique-id> --fixture-id <fixture> --environment-id <environment>`와 반환된 ID를 사용한 `timing-finish --attempt-id <id> --log-file <local-log>`로 감싼다. 실행 ID는 wave·fixture·환경·계획·단조 시계 세션에 결합되며 동일 실행 안에서 같은 task를 재시작할 수 없다. 재시도에는 새 실행 ID를 쓴다. `timing-summary`는 시작·종료가 모두 있고 같은 실행·fixture·환경·시작 코드 지문·부팅 세션·계획 지문에 속하는 시도만 하나의 wave 시간으로 집계한다. 시작 코드 지문이 다르면 같은 실행 ID라도 별도 그룹으로 나눈다. 각 wave 시간은 병렬 시도들의 합이 아니라 같은 조건의 가장 이른 시작부터 가장 늦은 종료까지로 계산한다. 시작·종료 코드 지문과 로그 해시를 남긴다. 미완료 시도·계획 변경·세션 불일치는 성능 비교에서 제외하며, 이 기록은 품질 게이트나 PASS 판정에 영향을 주지 않는다. 기준선과 후보 실행이 모두 최종 게이트를 통과하고 같은 checkout·scope·review mode·review profile·필수 검사·QA 계획을 사용해야 한다. 두 실행의 task·wave·fixture·환경·계획 조합 집합이 정확히 같고, 모든 조합에서 실행별 안정된 시작 코드 지문을 가진 완료 측정이 3회 이상일 때 후보 실행에서 `timing-summary --baseline-run-dir <baseline-run-dir>`를 실행한다. 비교기는 각 조합의 중앙값을 계산하며 모든 조합에서 후보 중앙값이 더 낮을 때만 `improved`를 반환한다. 조합 누락·표본 부족·불안정한 코드 지문·조건 불일치·품질 게이트 실패는 `unverified`라서 개선을 주장하지 않는다.
 
@@ -32,11 +32,23 @@ python3 <plugin-root>/scripts/orchestrate.py --scope both --review-mode <immedia
 - 계약 검토자: 두 영역이 관련될 때만 배정한다. balanced는 한 명, full은 서로 다른 세 명이 양쪽 설계의 요청·응답·오류·인증·호환성을 독립 대조한다.
 - 영역별 구현자: 승인 게이트 뒤 지정된 파일 소유 범위만 수정한다. 공유 파일은 코디네이터가 순서를 정한다.
 - 코드 검토자: light/balanced는 영역마다 한 명이 전체 항목을 검토하고, full은 서로 다른 세 명이 슬롯 1 설계 일치·회귀, 2 정확성·보안, 3 테스트·유지보수를 나눈다.
-- QA 담당자: light는 한 명이 단일 영역 전체를 수행한다. balanced는 영역별·연동별 한 명씩 모든 시나리오를 수행한다. full은 서로 다른 세 명이 슬롯 1 정상 흐름, 2 경계·오류·권한, 3 회귀·운영 환경을 나눠 실제 실행한다. 양쪽 작업의 계약·통합 QA도 같은 프로필별 인원 규칙을 따른다.
+- QA 담당자: light는 한 명이 단일 영역의 모든 acceptance 기준을 normal·regression 대표 사례로 확인한다. balanced는 영역별·연동별 한 명씩 모든 계획 사례를 수행한다. full은 서로 다른 세 명이 슬롯 1 정상 흐름, 2 경계·오류·권한, 3 회귀·운영 환경을 나눠 실제 실행한다. 양쪽 작업의 계약·통합 QA도 같은 프로필별 인원 규칙을 따른다.
 
 서브에이전트에게는 역할·작업 범위·읽을 문서·오케스트레이터가 출력한 슬롯별 `focus`와 질문·기대 산출물·편집 권한을 명시한다. `focus` 값은 결과 기록에도 그대로 사용한다. 검토 역할은 파일을 수정하지 않는다. 선택 프로필에 필요한 실제 canonical agent ID를 기록하고, full에서는 동일 단계·영역의 세 ID가 서로 다른지 확인한다. 필요한 인원을 확보하지 못하면 완료로 표시하지 않고 이유를 사용자에게 보고한다. 서브에이전트의 판단을 사용자 승인으로 취급하지 않는다. 코디네이터는 모든 결론·증거·상충 의견·미해결 항목과 원본 로컬 링크를 통합 리포트에 남긴다. 하네스는 agent ID 문자열의 실제 신원을 독립적으로 증명할 수 없다.
 
-## 신규 v8 실행 계획
+## 신규 policy-v4 실행 계획
+
+신규 실행은 init에 `--policy-version 4`, `--task-size small|medium|large`, `--scope-goal`, `--in-scope`, `--out-of-scope`, `--completion-criterion`을 전달한다. 생성된 로컬 `scope-contract.json`은 요청 ID, 목표, 포함·제외 범위, 완료 기준, `owner_role: coordinator`를 보관한다. `orchestrate.py --run-dir <local-run-dir> --include-waves` 출력은 coordinator 한 명을 전체 owner로 표시하고 계약을 작업 그래프에 포함한다. 각 하위 작업은 할당된 경로를 contract와 대조하고, 사용자 결정에 종속될 수 있는 경로는 실행 전에 아래 guard로 확인한다.
+
+```sh
+python3 <plugin-root>/scripts/workflow_harness.py task-guard --run-dir <local-run-dir> --path <repository-relative-path>
+```
+
+종료 코드 3이면 현재 pending 필수 결정과 경로가 겹치거나 경로 의존성을 안전하게 해석할 수 없으므로 해당 작업만 보류한다. 독립 경로 작업은 계속한다. 미응답 선택 질문은 최종 보고와 완료를 차단하지 않는다.
+
+설계 review digest는 영역마다 최대 두 개다. 첫 digest의 blocking finding을 사용자 승인한 뒤 딱 한 번 수정·재검토한다. 두 번째 결과에 finding이 남으면 `design-blocked` incomplete 보고서로 종료하고 세 번째 검토 digest는 새 실행에서 시작한다. low small 단일 영역의 QA plan은 `normal`·`regression`을 각각 하나 이상 포함하고 모든 acceptance criterion을 연결한다. 그 외 프로필은 적용 가능한 다섯 QA kind를 유지한다.
+
+## v8 상태 스키마와 신규 계획
 
 신규 v8 실행에서는 설계 검토 결과를 기록하기 전에 저장소의 의존성·실행 환경 버전에 맞춘 공식 문서/API 레퍼런스를 확인하고 `official-sources.json`을 작성한다. 각 출처는 ID, publisher, title, HTTPS URL, 문서 `version`, `checked_on`, 저장소에서 확인한 `detected_version`, `version_source`, `claims`, `applied_to`를 갖는다. 실행기는 형식을 검증하며, 코디네이터와 검토자가 detected version과 공식 문서 버전이 실제로 맞는지 대조한다. 적용 가능한 공식 문서는 적어도 하나여야 한다. 적용 자료가 없을 때만 `status: not_applicable`, 빈 `sources`, 구체적 `reason`을 기록한다. 기본 `pending` 상태는 설계 게이트를 막는다. 출처 매니페스트는 검사·설계·리뷰·QA·최종 보고 binding에 포함된다.
 
@@ -54,9 +66,9 @@ python3 <plugin-root>/scripts/orchestrate.py --scope both --review-mode <immedia
 
 계획과 설계 문서는 실행 폴더 안에 둔다. `design` 게이트는 계획의 범위·중복·수용 기준 커버리지를 검사하고 설계 및 계획 파일의 해시를 기록한다. 설계나 계획이 바뀌면 이전 게이트는 무효다. 원문 요구사항 자체가 설계에서 빠졌는지는 하네스가 알 수 없으므로 설계 검토자와 코디네이터가 대조한다.
 
-범위 밖 개선은 `scope-question`으로 `scope_extension`으로 등록하고, 원래 요청의 필수 동작에 답이 필요한 경우에만 `required_decision`을 사용한다. `scope_extension`은 요청 작업의 종속 게이트를 막지 않지만, 사용자가 질문에 응답하지 않았다면 질문 상태는 pending으로 유지한다. 그 질문과 무관한 설계·구현·검증 및 최종 보고서 초안 작성은 계속하되, 유효한 응답이나 명시적 거절 전에는 pending을 완료로 처리하지 않고 `report-publish`, 최종 게이트와 final 응답을 보류한다. 호스트가 현재 turn을 유지하는 동안에만 UI 응답을 기다릴 수 있으며, turn 종료·앱 종료 뒤 UI 생존은 보장되지 않는다. `required_decision`은 종속 작업만 멈추고 나머지 독립 작업을 계속한다. UI 호출이 성공했는지 확인할 수 없으면 질문이 전달되었다고 처리하지 않는다. 성공 확인이 없거나 UI가 없으면 같은 ID·revision을 유지해 재시도하거나 동일 질문을 대화로 제시한다. 그 질문을 직접 다루지 않는 새 입력이나 모호한 답변은 응답으로 간주하지 않는다. 명시적 거절은 유효한 답변으로 기록하며, 승인으로 오인하지 않는다.
+policy-v4의 질문 처리: `scope_extension`은 미응답이어도 핵심 구현·검증과 리포트 게시를 막지 않고 후속 항목으로 기록한다. `required_decision`은 `dependent_paths`와 작업 경로가 겹칠 때 해당 작업만 보류한다. 각 경로 실행 전에 `workflow_harness.py task-guard --run-dir <local-run-dir> --path <repo-relative-path>`를 호출한다. 종료 코드 3은 작업만 차단하며 무관한 경로는 계속한다. 답이 끝내 없으면 실제 완료 상태를 incomplete 보고서로 게시한다. v2-v3 실행에는 이 정책을 소급하지 않는다.
 
-작업이 재개되면 먼저 `scope-register.json`에서 pending 질문의 ID·revision·digest·question을 읽어 같은 질문을 UI에 다시 표시한다. register에는 별도 선택지 배열이 없으므로 `scope_extension`은 `승인하여 요청 범위에 포함`·`거절하고 요청 범위 유지`, `required_decision`은 `승인`·`거절`을 표준 라벨로 사용한다. 사용자 지정 라벨은 `scope-question --question`에 본문과 함께 저장한다. 그 다음 `status`를 조회한다. pending 질문은 독립 구현·검사·리뷰·QA를 막지 않으며 필수 게이트가 끝난 report 단계에서 `awaiting-user/answer-question`을 반환한다. `report-publish`는 pending 질문을 자동으로 닫지 않고 파일·state 변경 없이 거부한다. Codex 질문 UI를 띄운 뒤 호스트가 현재 turn을 유지하는 동안 최대 60초 간격으로 응답을 기다린다. 대기 반복으로 turn이 보장되지는 않는다. 중단 후 재개하면 저장된 같은 ID·revision을 다시 표시한다. 새 입력이 도착하면 해당 질문의 답인지 확인하고, 아니라면 pending 질문을 유지한다. 구버전 report-publish journal 복구는 최신 게시 직전의 연속된 같은 run ID unanswered 자동 종료 이벤트만 현재 발행으로 판단한다. 해당 suffix가 있을 때만 자동 종료 응답과 최신 게시 이벤트를 제거하고 원 질문을 pending으로 복원하며 잘못 게시된 문서는 interrupted 파일로 보존한다. 도구가 강제 중단된 뒤 재개해도 이 순서를 반복한다.
+재개 시 policy-v4 계약과 pending 질문을 읽고 저장된 동일한 question ID·revision으로 UI를 복원한 뒤 `status`를 확인한다. 선택 질문은 답을 기다리지 않고 보고 단계까지 간다. 필수 결정이 남으면 답변 UI를 표시하되 종속되지 않은 작업은 수행한다. 이미 독립 작업이 끝난 경우 incomplete 보고서를 게시하고 `answer-question`을 반환한다. v2-v3 실행은 기존 대기·게시 규칙을 유지한다.
 
 ## 로컬 하네스 게이트
 

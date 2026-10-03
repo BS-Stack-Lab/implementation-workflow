@@ -130,14 +130,13 @@ def build_plan(scope: str, review_mode: str = "immediate",
     if review_mode not in {"immediate", "user-review"}:
         raise ValueError(f"unsupported review mode: {review_mode}")
     if review_depth not in {"light", "balanced", "full"} \
-            or (review_depth == "light" and scope == "both") \
-            or (review_depth == "balanced" and scope != "both"):
-        raise ValueError("light is single-area and balanced is both-area only")
+            or (review_depth == "light" and scope == "both"):
+        raise ValueError("light is single-area only")
     slots = (1,) if review_depth in {"light", "balanced"} else (1, 2, 3)
 
     areas = ["frontend", "backend"] if scope == "both" else [scope]
     tasks: list[dict[str, object]] = [
-        {"id": "intake", "role": "coordinator", "depends_on": []}
+        {"id": "intake", "role": "coordinator", "owner_role": "coordinator", "depends_on": []}
     ]
     for area in areas:
         tasks.append({"id": f"design-{area}", "role": f"{area}-designer", "depends_on": ["intake"]})
@@ -214,14 +213,17 @@ def build_plan(scope: str, review_mode: str = "immediate",
                           "depends_on": qa_tasks})
         qa_tasks = [f"qa-integration-{slot}" for slot in slots]
     tasks.append({"id": "final-report", "role": "coordinator", "depends_on": qa_tasks})
+    for task in tasks:
+        task.setdefault("owner_role", "coordinator")
     return tasks
 
 
 def plan_envelope(tasks: list[dict[str, object]], same_checkout: bool = False,
-                  parallel_impl_safe: bool = False) -> dict[str, object]:
+                  parallel_impl_safe: bool = False, scope_contract: dict | None = None) -> dict[str, object]:
     return {"schema_version": 1, "plan": tasks,
             "parallel_waves": parallel_waves(tasks), "same_checkout": same_checkout,
-            "parallel_impl_safe": parallel_impl_safe}
+            "parallel_impl_safe": parallel_impl_safe, "owner_role": "coordinator",
+            "scope_contract": scope_contract}
 
 
 def exact_ownership_disjoint(run_dir: Path) -> bool:
@@ -293,8 +295,10 @@ def main() -> None:
                 or (args.review_depth and args.review_depth != depth):
             parser.error("run state conflicts with requested plan options")
         tasks = build_plan(scope, mode, depth, same_checkout, parallel_impl_safe)
+        contract_path = args.run_dir / "scope-contract.json"
+        contract = json.loads(contract_path.read_text(encoding="utf-8")) if contract_path.is_file() else None
         result = ({"status": status, "plan": tasks} if not args.include_waves else
-                  {"status": status, **plan_envelope(tasks, same_checkout, parallel_impl_safe)})
+                  {"status": status, **plan_envelope(tasks, same_checkout, parallel_impl_safe, contract)})
         print(json.dumps(result, ensure_ascii=False, indent=2))
         return
     if not args.scope or not args.review_mode:
