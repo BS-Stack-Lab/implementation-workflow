@@ -13,6 +13,7 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "scripts"))
 from orchestrate import build_plan
+from render_result import requires_test_code_assessment
 from workflow_harness import (design_digest, plan_digests, plans, read_state,
                               risk_guard, validate_scope_contract, write_state)
 
@@ -96,6 +97,11 @@ class PolicyV4Test(unittest.TestCase):
         self.init()
         state = read_state(self.run_dir)
         risk_guard(state)
+
+    def test_result_renderer_accepts_scope_bound_policy_marker(self) -> None:
+        self.init()
+        state = read_state(self.run_dir)
+        self.assertTrue(requires_test_code_assessment(state, self.run_dir))
 
     def test_policy_v4_light_requires_small_low_risk(self) -> None:
         self.init(depth="light", size="medium", expected=1)

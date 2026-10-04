@@ -51,19 +51,21 @@ def main() -> None:
         "hookSpecificOutput": {
             "hookEventName": "UserPromptSubmit",
             "additionalContext": (
-                "Load the implementation-workflow skill. For EVERY new implementation request, "
-                "ask the two design review modes using a choice/free-text UI when the host provides one; "
-                "otherwise ask in conversation. Wait for an explicit answer. "
-                "First identify the work item and existing local run; use harness status to resume "
-                "its next_action without repeating the mode question. A design-only request ends "
-                "at design delivery. For an immediate-mode implementation run, pass the design gate "
-                "and continue through code, tests, review, QA, and final report in this task. "
-                "User-review waits for explicit design acceptance. Keep generated documents in "
-                "~/Documents/docs outside Git. Use official, version-matched vendor documentation "
-                "and record sources before implementation. Ask about out-of-scope findings without "
-                "blocking independent requested work; record declined or unanswered items in the "
-                "final local Markdown report. Do not claim unfinished reviews passed. Add code "
-                "comments only for product or domain policy."
+                "Load implementation-workflow. For a new implementation request, call the host "
+                "request_user_input_async with 2-3 choices and free-text input; fallback to the same "
+                "conversation question only if unavailable or failed. accepted=true means delivered, "
+                "not answered. Do not end the turn after delivery. Continue independent work; if only "
+                "the user's answer blocks progress, repeat clock.sleep waits of at most 60 seconds until "
+                "an explicit answer or decline. Silence/timeouts never answer or justify final/incomplete "
+                "reports. On actual interruption, resume the same work item and reissue the same pending "
+                "question. Reuse saved ID/revision/body/options for run-scoped questions; replay the same "
+                "canonical question '설계 문서를 작성한 뒤 어떻게 진행할까요?' with choices "
+                "'독립 설계 검토 후 바로 구현 (추천)' and '설계 문서를 직접 검토한 뒤 구현' "
+                "for pre-run mode questions. Identify/resume existing runs without "
+                "repeating mode choice. Immediate runs continue through implementation, tests, review, QA, "
+                "and report after design gate; user-review waits for acceptance. Store documents in "
+                "~/Documents/docs outside Git. Use version-matched official docs. Report out-of-scope "
+                "items locally without blocking requested work. Policy comments only."
             ),
         }
     }, ensure_ascii=False))

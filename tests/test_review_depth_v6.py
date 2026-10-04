@@ -14,7 +14,7 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "scripts"))
 from orchestrate import (build_plan, exact_ownership_disjoint, focus_for, focus_question, model_for,
-                         parallel_waves)  # noqa: E402
+                         parallel_waves, plan_envelope)  # noqa: E402
 from run_check import capture  # noqa: E402
 from usage_checkpoint import record  # noqa: E402
 from workflow_harness import (compare_timing_summaries, plans, read_state, required_slots,
@@ -160,6 +160,44 @@ class ReviewDepthV6Test(unittest.TestCase):
         state["version"] = 5
         (self.run_dir / "state.json").write_text(json.dumps(state))
         self.assertEqual(required_slots(read_state(self.run_dir)), (1, 2, 3))
+
+    def test_plans_declare_native_executor_and_agent_reuse_policy(self) -> None:
+        for scope in ("frontend", "backend", "both"):
+            with self.subTest(scope=scope):
+                tasks = build_plan(scope, review_depth="full")
+                by_id = {task["id"]: task for task in tasks}
+                self.assertEqual({task["owner_role"] for task in tasks}, {"coordinator"})
+                self.assertTrue(all(task["executor"] in {"coordinator", "user", "subagent"}
+                                    for task in tasks))
+                self.assertEqual(by_id["intake"]["executor"], "coordinator")
+                self.assertEqual(by_id["final-report"]["executor"], "coordinator")
+                for area in (("frontend", "backend") if scope == "both" else (scope,)):
+                    implement = by_id[f"implement-{area}"]
+                    test = by_id[f"test-{area}"]
+                    self.assertEqual(implement["executor"], "subagent")
+                    self.assertEqual(implement["agent_action"], "spawn")
+                    self.assertEqual(test["executor"], "subagent")
+                    self.assertEqual(test["agent_action"], "reuse")
+                    self.assertEqual(test["agent_key"], implement["agent_key"])
+                    reviewers = [by_id[f"review-code-{area}-{slot}"] for slot in (1, 2, 3)]
+                    qa_agents = [by_id[f"qa-{area}-{slot}"] for slot in (1, 2, 3)]
+                    self.assertTrue(all(task["agent_action"] == "spawn" for task in reviewers + qa_agents))
+                    self.assertEqual(len({task["agent_key"] for task in reviewers}), 3)
+                    self.assertEqual(len({task["agent_key"] for task in qa_agents}), 3)
+                    self.assertEqual(len({task["agent_key"] for task in reviewers + qa_agents}), 6)
+                    self.assertTrue(all(task["agent_key"] != implement["agent_key"]
+                                        for task in reviewers + qa_agents))
+                if scope == "both":
+                    self.assertTrue(all(by_id[f"review-contract-{slot}"]["agent_action"] == "spawn"
+                                        for slot in (1, 2, 3)))
+                user_plan = {task["id"]: task for task in build_plan(
+                    scope, review_mode="user-review", review_depth="full")}
+                self.assertEqual(user_plan["accept-design"]["executor"], "user")
+                envelope = plan_envelope(tasks)
+                self.assertEqual(envelope["dispatch_policy"]["tool_family"],
+                                 "host-native-collaboration")
+                self.assertEqual(envelope["dispatch_policy"]["capacity"], "reported-or-serial")
+                self.assertTrue(envelope["dispatch_policy"]["wave_barrier"])
 
     def test_risky_path_and_both_scope_rejected(self) -> None:
         (self.repo / "security.py").write_text("changed\n")

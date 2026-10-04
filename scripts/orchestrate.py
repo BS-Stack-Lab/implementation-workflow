@@ -215,6 +215,13 @@ def build_plan(scope: str, review_mode: str = "immediate",
     tasks.append({"id": "final-report", "role": "coordinator", "depends_on": qa_tasks})
     for task in tasks:
         task.setdefault("owner_role", "coordinator")
+        role = task["role"]
+        task["executor"] = "user" if role == "user" else (
+            "coordinator" if role == "coordinator" else "subagent"
+        )
+        if task["executor"] == "subagent":
+            task["agent_key"] = role
+            task["agent_action"] = "reuse" if str(task["id"]).startswith("test-") else "spawn"
     return tasks
 
 
@@ -223,6 +230,12 @@ def plan_envelope(tasks: list[dict[str, object]], same_checkout: bool = False,
     return {"schema_version": 1, "plan": tasks,
             "parallel_waves": parallel_waves(tasks), "same_checkout": same_checkout,
             "parallel_impl_safe": parallel_impl_safe, "owner_role": "coordinator",
+            "dispatch_policy": {
+                "tool_family": "host-native-collaboration",
+                "capacity": "reported-or-serial",
+                "capacity_rejection": "queue-and-retry-after-completion",
+                "wave_barrier": True,
+            },
             "scope_contract": scope_contract}
 
 

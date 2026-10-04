@@ -24,6 +24,12 @@ python3 <plugin-root>/scripts/orchestrate.py --scope both --review-mode <immedia
 
 실행 시간을 비교할 때는 각 대표 작업을 `timing-start --task-id <task> --wave-id <wave> --wave-execution-id <unique-id> --fixture-id <fixture> --environment-id <environment>`와 반환된 ID를 사용한 `timing-finish --attempt-id <id> --log-file <local-log>`로 감싼다. 실행 ID는 wave·fixture·환경·계획·단조 시계 세션에 결합되며 동일 실행 안에서 같은 task를 재시작할 수 없다. 재시도에는 새 실행 ID를 쓴다. `timing-summary`는 시작·종료가 모두 있고 같은 실행·fixture·환경·시작 코드 지문·부팅 세션·계획 지문에 속하는 시도만 하나의 wave 시간으로 집계한다. 시작 코드 지문이 다르면 같은 실행 ID라도 별도 그룹으로 나눈다. 각 wave 시간은 병렬 시도들의 합이 아니라 같은 조건의 가장 이른 시작부터 가장 늦은 종료까지로 계산한다. 시작·종료 코드 지문과 로그 해시를 남긴다. 미완료 시도·계획 변경·세션 불일치는 성능 비교에서 제외하며, 이 기록은 품질 게이트나 PASS 판정에 영향을 주지 않는다. 기준선과 후보 실행이 모두 최종 게이트를 통과하고 같은 checkout·scope·review mode·review profile·필수 검사·QA 계획을 사용해야 한다. 두 실행의 task·wave·fixture·환경·계획 조합 집합이 정확히 같고, 모든 조합에서 실행별 안정된 시작 코드 지문을 가진 완료 측정이 3회 이상일 때 후보 실행에서 `timing-summary --baseline-run-dir <baseline-run-dir>`를 실행한다. 비교기는 각 조합의 중앙값을 계산하며 모든 조합에서 후보 중앙값이 더 낮을 때만 `improved`를 반환한다. 조합 누락·표본 부족·불안정한 코드 지문·조건 불일치·품질 게이트 실패는 `unverified`라서 개선을 주장하지 않는다.
 
+### 네이티브 에이전트 배정
+
+`orchestrate.py`는 `executor`, `agent_key`, `agent_action` 계획을 출력하지만 에이전트를 생성하지 않는다. coordinator는 계획을 실행할 때 Codex native `collaboration.spawn_agent`를 실제 호출한다. `spawn` 작업은 도구가 반환한 실제 agent ID로 기록하고, `reuse` 작업은 같은 `agent_key`의 살아있는 구현 에이전트에게 후속 지시를 보낸다. 구현 agent는 자기 구현 직후 해당 영역 필수 검사를 수행할 수 있다. 설계 검토·코드 검토·QA는 산출물 작성자와 다른 agent를 spawn하며, full의 슬롯별 ID도 서로 달라야 한다. 각각의 지시에는 작업 범위, 경로 소유권, 읽기/쓰기 권한, 공식 출처, 슬롯별 확인 질문, 기대 결과와 보고 형식을 넣는다. coordinator가 완료를 기다려 결과·산출물 경로를 확인하고 로컬 dispatch 기록에 task ID·실제 agent ID·상태·결과 경로를 연결한다. 리뷰·QA는 기존 harness의 `stage/area/slot/agent_id` 필드로 기록한다. 계획 스크립트만 실행하고 실제 도구를 호출하지 않은 결과는 subagent 배정으로 취급하지 않는다.
+
+호스트가 현재 가용 용량을 명시적으로 알려주면 그 수를 동시 실행 상한으로 쓴다. 알려주지 않으면 agent를 한 번에 하나씩 실행한다. 용량 초과로 spawn이 거절되면 작업을 같은 wave 대기열에 남겨 놓고 실행 중 agent 하나가 끝난 뒤 다시 시도한다. 활성 agent가 없는데 tool 사용이 불가능하거나 재시도에 실패하면 필수 단계는 `incomplete`다. 다음 wave는 현재 wave의 모든 작업 결과를 회수한 뒤 시작한다. 필요한 native collaboration 도구가 세션에 없으면 가짜 ID나 수동 실행을 에이전트 결과처럼 기록하지 않는다. 독립 리뷰·QA를 확보할 수 없을 경우 사용자에게 제한과 미완료 게이트를 보고한다. Python 계획기가 별도 API 세션이나 API 키로 도구를 생성하지 않는다.
+
 ## 역할과 결과
 
 - 코디네이터: 요구사항과 실제 변경 영역을 판별하고 설계·검토·승인·검증의 증거를 로컬 작업 폴더에 기록한다. 공유 파일과 범위 변경을 관리한다.
@@ -66,9 +72,9 @@ python3 <plugin-root>/scripts/workflow_harness.py task-guard --run-dir <local-ru
 
 계획과 설계 문서는 실행 폴더 안에 둔다. `design` 게이트는 계획의 범위·중복·수용 기준 커버리지를 검사하고 설계 및 계획 파일의 해시를 기록한다. 설계나 계획이 바뀌면 이전 게이트는 무효다. 원문 요구사항 자체가 설계에서 빠졌는지는 하네스가 알 수 없으므로 설계 검토자와 코디네이터가 대조한다.
 
-policy-v4의 질문 처리: `scope_extension`은 미응답이어도 핵심 구현·검증과 리포트 게시를 막지 않고 후속 항목으로 기록한다. `required_decision`은 `dependent_paths`와 작업 경로가 겹칠 때 해당 작업만 보류한다. 각 경로 실행 전에 `workflow_harness.py task-guard --run-dir <local-run-dir> --path <repo-relative-path>`를 호출한다. 종료 코드 3은 작업만 차단하며 무관한 경로는 계속한다. 답이 끝내 없으면 실제 완료 상태를 incomplete 보고서로 게시한다. v2-v3 실행에는 이 정책을 소급하지 않는다.
+policy-v4의 질문 처리: `scope_extension`은 미응답이어도 핵심 구현·검증과 리포트 게시를 막지 않고 후속 항목으로 기록한다. `required_decision`은 `dependent_paths`와 작업 경로가 겹칠 때 해당 작업만 보류한다. 각 경로 실행 전에 `workflow_harness.py task-guard --run-dir <local-run-dir> --path <repo-relative-path>`를 호출한다. 종료 코드 3은 작업만 차단하며 무관한 경로는 계속한다. 필수 질문이 남고 현재 turn이 활성 상태이면 대기 루프를 유지하고 incomplete 보고서를 게시하지 않는다. 실제 turn이 중단된 경우에만 pending 질문을 둔 incomplete 상태로 넘긴다. 저장 상태 및 구버전 정책은 소급 변경하지 않는다.
 
-재개 시 policy-v4 계약과 pending 질문을 읽고 저장된 동일한 question ID·revision으로 UI를 복원한 뒤 `status`를 확인한다. 선택 질문은 답을 기다리지 않고 보고 단계까지 간다. 필수 결정이 남으면 답변 UI를 표시하되 종속되지 않은 작업은 수행한다. 이미 독립 작업이 끝난 경우 incomplete 보고서를 게시하고 `answer-question`을 반환한다. v2-v3 실행은 기존 대기·게시 규칙을 유지한다.
+재개 시 policy-v4 계약과 pending 질문을 읽고 저장된 동일한 question ID·revision·본문(선택지 포함)으로 UI를 복원한 뒤 `status`를 확인한다. 선택 질문은 답을 기다리지 않고 보고 단계까지 간다. 필수 결정이 남으면 답변 UI를 표시하고 종속되지 않은 작업을 수행한다. 응답 대기 중 현재 turn이 살아 있으면 반복 대기하며, 실제 중단이 발생한 뒤에만 `answer-question`으로 재개한다. 실행 전 mode 질문은 저장 register가 없으므로 canonical 질문과 선택지를 다시 제시한다. 저장 상태·완료 실행의 버전별 게이트 규칙은 변경하지 않는다.
 
 ## 로컬 하네스 게이트
 
@@ -100,6 +106,6 @@ python3 <plugin-root>/scripts/workflow_harness.py report-publish --run-dir <loca
 
 `final` 게이트는 현재 설계·계획·Git 코드 상태와 프로필별 코드 검토·QA 결과, 각 계획 시나리오의 최신 결과, 모든 적용 수용 기준의 커버리지, 최종 리포트를 확인한다. 모든 과거 자동 검증·QA 시도의 증거 파일은 실행 폴더 아래 비어 있지 않은 일반 파일이어야 하고, 시도마다 고유하며 원래 해시와 일치해야 한다. 심볼릭 링크와 실행 폴더 밖 경로는 사용할 수 없다. 두 영역이면 프로필에 필요한 연동 QA 원본과 통합 문서도 필요하다. 같은 코드 상태에서 코드 검토 `findings`를 해결해 다시 통과시키려면 `resolve-agent`에 해결 근거를 기록한 다음 결과를 다시 기록한다. 검사나 QA 시나리오 실패·미실행 뒤에는 각각 `resolve-check` 또는 `resolve-qa-case`로 원인·조치를 기록하고 같은 ID를 새 증거로 재실행한다. 환경 복구나 설명만으로 PASS로 바꾸지 않는다. 코드나 설계가 바뀌면 관련 검사·프로필별 검토·QA를 새 상태에서 다시 수행한다. 필수 미실행 및 QA `not-run`은 완료가 아니다. 기록된 agent ID, 사용자 응답, 증거 내용의 진실성은 하네스가 독립적으로 증명할 수 없으므로 코디네이터가 실제 결과를 확인한다.
 
-사용자 질문에는 해당 질문 유형에 허용된 Codex 질문 UI를 우선 사용해 선택지와 자유 입력을 제공한다. 도구 결과에서 질문 등록을 확인한 경우에만 UI 전달 성공으로 본다. UI가 없거나 실패한 경우 같은 질문과 선택지를 일반 대화로 제시한다. 정확한 버튼 이름은 Codex 클라이언트가 제어한다. 검토 지연 시간은 운영상의 soft target으로 관리한다. 제한 시간을 넘어도 판단이 오지 않으면 지연 슬롯과 blocker를 기록하고 독립 작업을 계속하되 해당 검토를 통과 처리하지 않는다. 검토 지연 정책은 사용자 질문의 응답 대기를 끝내는 근거가 되지 않는다. 기존 v2~v7 완료 실행은 과거 기록으로 유지하며, 미완료 실행은 정확히 재개할 때 현재 v8 게이트로 승격하고 이전 미결합 PASS를 다시 검증한다.
+필수 사용자 선택에는 `request_user_input_async`를 호출해 선택지와 자유 입력을 제공한다. `accepted: true`는 전달 접수만 뜻한다. 실제 답이나 명시적 거절 전에 질문을 완료 처리하거나 현재 turn을 끝내지 않는다. 독립 작업은 이어가고, 남은 종속 작업이 응답에 막혔으면 `clock.sleep`을 최대 60초씩 반복해 입력을 기다린다. timeout·침묵·검토 soft target은 질문 종료나 incomplete 보고의 근거가 아니다. 관련 없는 입력은 pending으로 둔다. UI가 없거나 호출이 실패한 경우 같은 질문을 대화로 제시하고 같은 대기 규칙을 쓴다. 실제 turn 중단 뒤에는 미완료 실행을 재개하고 run-scoped 질문의 같은 ID·revision·본문·선택지로 UI를 다시 연다. 실행 전 질문은 동일한 canonical 질문을 다시 제시한다. 앱/turn 종료 뒤 질문 UI 지속은 보장하지 않는다. 기존 v2~v7 저장 상태 형식은 보존하고, 완료 실행은 과거 기록으로 유지하며, 미완료 실행은 현재 게이트로 승격할 때 기존 evidence 재검증 규칙을 따른다.
 
 최종 보고서는 실행 폴더에 작성하고 `report-publish`로 현재 코드·설계·계획·질문·출처에 묶어 게시한다. 변경 파일과 코드 위치, 동작 원리, 검증 결과, 요청 밖 문제와 질문 상태를 포함한다. 제품·도메인 정책을 설명하는 경우에만 코드 주석을 추가한다.

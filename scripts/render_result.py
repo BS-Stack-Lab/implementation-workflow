@@ -105,7 +105,8 @@ def requires_test_code_assessment(state: dict, run_dir: Path | None = None) -> b
                 raise ValueError("invalid run policy marker") from error
             marker_version = marker.get("policy_version") if isinstance(marker, dict) else None
             if not isinstance(state.get("run_id"), str) or type(marker_version) is not int \
-                    or marker != run_policy_data(state["run_id"], marker_version) \
+                    or marker != run_policy_data(state["run_id"], marker_version,
+                                                 state.get("scope_contract_digest")) \
                     or marker_version != policy_version:
                 raise ValueError("run policy marker does not match initialized run state")
         elif policy_version >= 2:
